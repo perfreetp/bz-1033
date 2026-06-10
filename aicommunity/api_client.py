@@ -393,18 +393,60 @@ MOCK_FAVORITES: Dict[str, List[str]] = {
 
 
 class APIClient:
-    """社区API客户端（包含模拟数据）。"""
+    """社区API客户端（包含模拟数据和本地持久化）。"""
+
+    CACHE_KEY = "aicommunity_state_v1"
 
     def __init__(self, config: ConfigManager):
         self.config = config
-        self._posts: List[Dict[str, Any]] = [p.copy() for p in MOCK_POSTS]
-        self._drafts: List[Dict[str, Any]] = [d.copy() for d in MOCK_DRAFTS]
-        self._prompts: List[Dict[str, Any]] = [p.copy() for p in MOCK_PROMPTS]
-        self._notifications: List[Dict[str, Any]] = [n.copy() for n in MOCK_NOTIFICATIONS]
-        self._comments: Dict[str, List[Dict[str, Any]]] = {k: [c.copy() for c in v] for k, v in MOCK_COMMENTS.items()}
-        self._following: List[Dict[str, Any]] = [f.copy() for f in MOCK_FOLLOWING]
-        self._activities: List[Dict[str, Any]] = [a.copy() for a in MOCK_ACTIVITIES]
-        self._favorites: Dict[str, List[str]] = {k: v.copy() for k, v in MOCK_FAVORITES.items()}
+        self._load_state()
+
+    def _state_key(self) -> str:
+        """获取全局状态的缓存键（所有用户共享帖子/草稿/提示词，点赞收藏等按用户隔离）。"""
+        return self.CACHE_KEY
+
+    def _load_state(self) -> None:
+        """从本地cache加载状态，若无则使用默认mock数据。"""
+        cache = self.config.load_cache()
+        state = cache.get(self._state_key(), {})
+
+        if state:
+            self._posts = state.get("posts", [])
+            self._drafts = state.get("drafts", [])
+            self._prompts = state.get("prompts", [])
+            self._notifications = state.get("notifications", [])
+            self._comments = state.get("comments", {})
+            self._following = state.get("following", [])
+            self._activities = state.get("activities", [])
+            self._favorites = state.get("favorites", {"posts": [], "prompts": [], "comments": []})
+            self._liked_posts = state.get("liked_posts", [])
+        else:
+            self._posts: List[Dict[str, Any]] = [p.copy() for p in MOCK_POSTS]
+            self._drafts: List[Dict[str, Any]] = [d.copy() for d in MOCK_DRAFTS]
+            self._prompts: List[Dict[str, Any]] = [p.copy() for p in MOCK_PROMPTS]
+            self._notifications: List[Dict[str, Any]] = [n.copy() for n in MOCK_NOTIFICATIONS]
+            self._comments: Dict[str, List[Dict[str, Any]]] = {k: [c.copy() for c in v] for k, v in MOCK_COMMENTS.items()}
+            self._following: List[Dict[str, Any]] = [f.copy() for f in MOCK_FOLLOWING]
+            self._activities: List[Dict[str, Any]] = [a.copy() for a in MOCK_ACTIVITIES]
+            self._favorites: Dict[str, List[str]] = {k: v.copy() for k, v in MOCK_FAVORITES.items()}
+            self._liked_posts: List[str] = [p["id"] for p in self._posts if p.get("is_liked")]
+            self.save()
+
+    def save(self) -> None:
+        """将当前状态保存到本地cache。"""
+        cache = self.config.load_cache()
+        cache[self._state_key()] = {
+            "posts": self._posts,
+            "drafts": self._drafts,
+            "prompts": self._prompts,
+            "notifications": self._notifications,
+            "comments": self._comments,
+            "following": self._following,
+            "activities": self._activities,
+            "favorites": self._favorites,
+            "liked_posts": self._liked_posts,
+        }
+        self.config.save_cache(cache)
 
     # ==================== 帖子相关 ====================
 
@@ -433,6 +475,7 @@ class APIClient:
         self._posts.insert(0, new_post)
         self._add_activity(username, user_info.get("display_name", username), user_info.get("avatar", "👤"),
                           "发布了新帖子", content[:30] + "..." if len(content) > 30 else content, "post", new_post["id"])
+        self.save()
         return new_post
 
     def list_posts(self, page: int = 1, page_size: int = 20, author: Optional[str] = None,
@@ -468,9 +511,14 @@ class APIClient:
             if post["is_liked"]:
                 post["likes"] -= 1
                 post["is_liked"] = False
+                if post_id in self._liked_posts:
+                    self._liked_posts.remove(post_id)
             else:
                 post["likes"] += 1
                 post["is_liked"] = True
+                if post_id not in self._liked_posts:
+                    self._liked_posts.append(post_id)
+            self.save()
             return True
         return False
 
@@ -512,6 +560,7 @@ class APIClient:
         }
         self._drafts.insert(0, new_draft)
         self._save_draft_to_local(new_draft)
+        self.save()
         return new_draft
 
     def update_draft(self, draft_id: str, **kwargs) -> Optional[Dict[str, Any]]:
@@ -526,6 +575,7 @@ class APIClient:
             if "content" in kwargs:
                 draft["word_count"] = len(kwargs["content"])
             self._save_draft_to_local(draft)
+            self.save()
             return draft
         return None
 
@@ -535,6 +585,7 @@ class APIClient:
         if draft and draft["status"] == "draft":
             draft["status"] = "reviewing"
             draft["updated_at"] = datetime.now().isoformat()
+            self.save()
             return draft
         return None
 
@@ -551,6 +602,8 @@ class APIClient:
                 synced += 1
             elif draft["author"] == username:
                 total += 1
+        if synced > 0:
+            self.save()
         return synced, total
 
     def _save_draft_to_local(self, draft: Dict[str, Any]) -> None:
@@ -630,6 +683,7 @@ class APIClient:
                 json.dump(new_prompt, f, ensure_ascii=False, indent=2)
         except IOError:
             pass
+        self.save()
         return new_prompt
 
     def check_violation(self, content: str) -> Tuple[bool, List[str]]:
@@ -721,6 +775,7 @@ class APIClient:
             current_info = self.config.get("user_info") or {}
             self._add_activity(current_user, current_info.get("display_name", current_user),
                               current_info.get("avatar", "👤"), "关注了", info["display_name"], "user", username_to_follow)
+            self.save()
             return follow_info
         return None
 
@@ -729,6 +784,7 @@ class APIClient:
         for i, f in enumerate(self._following):
             if f["username"] == username:
                 del self._following[i]
+                self.save()
                 return True
         return False
 
@@ -758,6 +814,7 @@ class APIClient:
             "created_at": datetime.now().isoformat(),
         }
         self._activities.insert(0, activity)
+        self.save()
 
     # ==================== 通知相关 ====================
 
@@ -780,6 +837,7 @@ class APIClient:
         for notif in self._notifications:
             if notif["id"] == notif_id:
                 notif["read"] = True
+                self.save()
                 return True
         return False
 
@@ -790,6 +848,8 @@ class APIClient:
             if not notif["read"]:
                 notif["read"] = True
                 count += 1
+        if count > 0:
+            self.save()
         return count
 
     def reply_comment(self, target_id: str, content: str,
@@ -815,9 +875,15 @@ class APIClient:
             for comment in self._comments[target_id]:
                 if comment["id"] == reply_to_comment_id:
                     comment["replies"].append(new_comment)
+                    self.save()
                     return new_comment
         else:
             self._comments[target_id].append(new_comment)
+            # 更新帖子的评论计数
+            post = self.get_post(target_id)
+            if post:
+                post["comments"] = post.get("comments", 0) + 1
+            self.save()
             return new_comment
         return None
 
@@ -851,6 +917,7 @@ class APIClient:
             if prompt:
                 prompt["is_favorited"] = favorited
 
+        self.save()
         return True, favorited
 
     def list_favorites(self, content_type: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:

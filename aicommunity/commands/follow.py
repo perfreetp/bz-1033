@@ -232,7 +232,7 @@ def user_activity(ctx, username, page):
         console.print(f"[yellow]用户 @{username} 暂无活动记录[/yellow]")
         return
 
-    from .auth import get_user_info
+    from ..auth import get_user_info
     user_info = get_user_info(username)
     if user_info:
         console.print()
@@ -279,7 +279,7 @@ def suggest_users(ctx, n):
     following = [f["username"] for f in client.list_following()]
     current_user = config.get("username")
 
-    from .auth import MOCK_USERS_DB
+    from ..auth import MOCK_USERS_DB
     suggestions = []
     for uname, info in MOCK_USERS_DB.items():
         if uname in following or uname == current_user:

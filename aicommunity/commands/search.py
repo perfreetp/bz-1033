@@ -313,7 +313,7 @@ def by_author(ctx, author_name, min_likes, page):
         console.print(f"[yellow]未找到作者「{author_name}」的内容[/yellow]")
         return
 
-    from .auth import get_user_info
+    from ..auth import get_user_info
     user = get_user_info(author_name)
     if user:
         console.print()
