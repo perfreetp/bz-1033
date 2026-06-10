@@ -28,6 +28,7 @@ from .commands.search import search as search_group
 from .commands.follow import follow as follow_group
 from .commands.notify import notify as notify_group
 from .commands.export import export as export_group
+from .commands.backup import backup as backup_group
 
 console = Console()
 
@@ -48,7 +49,8 @@ class AicommCli(click.Group):
             ("search", "搜索与发现", "内容搜索、热门话题、高赞案例、作者搜索"),
             ("follow", "关注与社区动态", "关注作者、时间线、用户活动、推荐作者"),
             ("notify", "通知与互动", "消息通知、回复评论、收藏内容管理"),
-            ("export", "数据导出与报告", "批量导出提示词、个人月报、统计分析"),
+            ("export", "数据导出与报告", "批量导出提示词、个人月报、统计分析、操作审计"),
+            ("backup", "离线备份与恢复", "手动备份、列表查看、备份概要、回滚恢复"),
         ]
 
         console.print()
@@ -133,6 +135,7 @@ cli.add_command(search_group)
 cli.add_command(follow_group)
 cli.add_command(notify_group)
 cli.add_command(export_group)
+cli.add_command(backup_group)
 
 
 def main():

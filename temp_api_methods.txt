@@ -1,0 +1,512 @@
+﻿
+    # ============ 操作审计日志 ============
+    def _log_audit(self, action: str, target_type: str, target_id: str = "", detail: str = "") -> None:
+        """记录操作审计日志。"""
+        username = self.config.get("username", "anonymous")
+        log_entry = {
+            "id": f"audit_{int(time.time())}_{len(self._audit_logs)+1:04d}",
+            "timestamp": datetime.now().isoformat(),
+            "user": username,
+            "action": action,  # like/unlike/favorite/unfavorite/follow/unfollow/submit_prompt/approve_prompt/reject_prompt/transfer_draft/approve_draft/reject_draft/backup/restore
+            "target_type": target_type,  # post/prompt/draft/user/backup
+            "target_id": target_id,
+            "detail": detail,
+            "ip": "127.0.0.1",
+        }
+        self._audit_logs.append(log_entry)
+        self.save()
+
+    def export_audit(self, output_dir: str, format_type: str = "csv",
+                     actions: Optional[List[str]] = None,
+                     days: Optional[int] = None,
+                     from_date: Optional[str] = None,
+                     to_date: Optional[str] = None) -> Tuple[int, str]:
+        """导出当前用户操作审计日志。"""
+        username = self.config.get("username", "anonymous")
+        logs = [l for l in self._audit_logs if l["user"] == username]
+        if actions:
+            logs = [l for l in logs if l["action"] in actions]
+        now = datetime.now()
+        cutoff = None
+        if days:
+            cutoff = now - timedelta(days=days)
+        start_dt = None
+        if from_date:
+            start_dt = datetime.fromisoformat(from_date)
+        end_dt = None
+        if to_date:
+            end_dt = datetime.fromisoformat(to_date)
+        if cutoff or start_dt or end_dt:
+            filtered = []
+            for l in logs:
+                lt = datetime.fromisoformat(l["timestamp"])
+                if cutoff and lt < cutoff:
+                    continue
+                if start_dt and lt < start_dt:
+                    continue
+                if end_dt and lt > end_dt:
+                    continue
+                filtered.append(l)
+            logs = filtered
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
+        if format_type == "json":
+            filename = f"audit_logs_{timestamp}.json"
+            filepath = os.path.join(output_dir, filename)
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(logs, f, ensure_ascii=False, indent=2)
+        else:  # csv 默认
+            filename = f"audit_logs_{timestamp}.csv"
+            filepath = os.path.join(output_dir, filename)
+            with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["审计ID", "时间", "操作人", "动作", "对象类型", "对象ID", "详情", "IP"])
+                for l in logs:
+                    writer.writerow([
+                        l["id"], l["timestamp"], l["user"], l["action"],
+                        l["target_type"], l["target_id"], l["detail"], l["ip"]
+                    ])
+        return len(logs), filepath
+
+    # ============ 草稿协作流转 ============
+    def transfer_draft(self, draft_id: str, reviewer: str, note: str = "") -> Tuple[bool, str, Optional[Dict]]:
+        """将草稿转给审阅人审核。"""
+        username = self.config.get("username", "anonymous")
+        draft = self.get_draft(draft_id)
+        if not draft:
+            return False, "草稿不存在", None
+        if draft["author"] != username:
+            return False, "只有作者本人可以转让审阅", None
+        if reviewer not in VALID_USERS:
+            return False, f"审阅人 {reviewer} 不存在", None
+        draft["reviewer"] = reviewer
+        draft["status"] = "transferred"
+        if note:
+            draft["review_comments"].append({
+                "id": f"rc_{int(time.time())}",
+                "reviewer": username,
+                "comment": note,
+                "created_at": datetime.now().isoformat(),
+            })
+        draft["audit_history"].append({
+            "action": "transfer",
+            "actor": username,
+            "time": datetime.now().isoformat(),
+            "detail": f"转让审阅给 {reviewer}{(': '+note) if note else ''}",
+        })
+        self.save()
+        self._log_audit("transfer_draft", "draft", draft_id, f"reviewer={reviewer}")
+        return True, f"已转让给{VALID_USERS[reviewer]['display_name']}审阅", draft
+
+    def review_draft(self, draft_id: str, action: str, comment: str = "",
+                     reason: str = "") -> Tuple[bool, str, Optional[Dict]]:
+        """审阅人对草稿操作：approve（批准）/ reject（退回）/ comment（批注）。"""
+        username = self.config.get("username", "anonymous")
+        draft = self.get_draft(draft_id)
+        if not draft:
+            return False, "草稿不存在", None
+        if draft.get("reviewer") != username:
+            return False, f"只有当前审阅人（{draft.get('reviewer', '未指定')}）可审阅此草稿", None
+        if comment:
+            draft["review_comments"].append({
+                "id": f"rc_{int(time.time())}",
+                "reviewer": username,
+                "comment": comment,
+                "created_at": datetime.now().isoformat(),
+            })
+        if action == "comment":
+            draft["audit_history"].append({
+                "action": "review_comment",
+                "actor": username,
+                "time": datetime.now().isoformat(),
+                "detail": f"添加批注: {comment[:50]}",
+            })
+            self.save()
+            self._log_audit("comment_draft", "draft", draft_id, comment[:80])
+            return True, "批注已添加", draft
+        if action == "approve":
+            draft["status"] = "approved"
+            draft["audit_history"].append({
+                "action": "approve",
+                "actor": username,
+                "time": datetime.now().isoformat(),
+                "detail": "批准发布",
+            })
+            self.save()
+            self._log_audit("approve_draft", "draft", draft_id, comment[:80] or "批准发布")
+            return True, "草稿已批准，可提交发布", draft
+        if action == "reject":
+            draft["status"] = "rejected"
+            if reason:
+                draft["review_comments"].append({
+                    "id": f"rc_{int(time.time())}",
+                    "reviewer": username,
+                    "comment": f"【退回原因】{reason}",
+                    "created_at": datetime.now().isoformat(),
+                })
+            draft["audit_history"].append({
+                "action": "reject",
+                "actor": username,
+                "time": datetime.now().isoformat(),
+                "detail": f"退回: {(reason or comment)[:80]}",
+            })
+            self.save()
+            self._log_audit("reject_draft", "draft", draft_id, reason or comment)
+            return True, f"已退回草稿：{reason or comment}", draft
+        return False, "action 必须是 approve/reject/comment 之一", None
+
+    # 重写 list_drafts 增加视角筛选
+    # （原来的方法保留，在其基础上增加 perspective 参数。我们 override 掉）
+    def list_drafts(self, page: int = 1, page_size: int = 20,
+                    status: Optional[str] = None,
+                    author: Optional[str] = None,
+                    category: Optional[str] = None,
+                    days: Optional[int] = None,
+                    from_date: Optional[str] = None,
+                    to_date: Optional[str] = None,
+                    only_local: bool = False,
+                    mine_only: bool = False,
+                    perspective: Optional[str] = None) -> Tuple[List[Dict[str, Any]], int]:
+        """列表：status/author/category/perspective(待我处理/我发起的/已退回) + 多维筛选。"""
+        username = self.config.get("username", "anonymous")
+        drafts = list(self._drafts)
+
+        # 视角筛选（优先于其他）
+        if perspective == "pending_me":
+            # 待我处理：reviewer=我，状态 transferred
+            drafts = [d for d in drafts if d.get("reviewer") == username and d.get("status") == "transferred"]
+        elif perspective == "my_initiated":
+            # 我发起的：author=我
+            drafts = [d for d in drafts if d["author"] == username]
+        elif perspective == "rejected_to_me":
+            # 已退还给我：author=我，状态 rejected
+            drafts = [d for d in drafts if d["author"] == username and d.get("status") == "rejected"]
+        elif perspective == "rejected":
+            drafts = [d for d in drafts if d.get("status") == "rejected"]
+        elif perspective == "transferred":
+            drafts = [d for d in drafts if d.get("status") == "transferred"]
+        elif perspective == "approved":
+            drafts = [d for d in drafts if d.get("status") == "approved"]
+
+        if mine_only or (perspective is None and author is None and status is None and not mine_only and username != "anonymous"):
+            if mine_only:
+                drafts = [d for d in drafts if d["author"] == username]
+
+        if status:
+            drafts = [d for d in drafts if d.get("status") == status]
+        if author:
+            drafts = [d for d in drafts if d.get("author") == author]
+        if category:
+            drafts = [d for d in drafts if d.get("category") == category]
+        if days:
+            cutoff = datetime.now() - timedelta(days=days)
+            drafts = [d for d in drafts if datetime.fromisoformat(d["updated_at"]) >= cutoff]
+        if from_date:
+            start_dt = datetime.fromisoformat(from_date)
+            drafts = [d for d in drafts if datetime.fromisoformat(d["updated_at"]) >= start_dt]
+        if to_date:
+            end_dt = datetime.fromisoformat(to_date)
+            drafts = [d for d in drafts if datetime.fromisoformat(d["updated_at"]) <= end_dt]
+        if only_local:
+            drafts = [d for d in drafts if not d.get("is_synced", False)]
+
+        total = len(drafts)
+        start = (page - 1) * page_size
+        return drafts[start:start + page_size], total
+
+    # ============ 提示词发布审核 ============
+    def submit_prompt_for_approval(self, prompt_id: str) -> Tuple[bool, str, Optional[Dict]]:
+        """私有提示词申请公开：approval_status = pending_review。"""
+        username = self.config.get("username", "anonymous")
+        prompt = self._get_prompt_raw_unchecked(prompt_id)
+        if not prompt:
+            return False, "提示词不存在", None
+        if prompt["author"] != username:
+            return False, "只有作者本人可以申请公开", None
+        if prompt.get("approval_status") == "approved":
+            return False, "提示词已经是公开状态，无需再次申请", None
+        prompt["approval_status"] = "pending_review"
+        prompt["rejection_reason"] = None
+        prompt["approval_history"].append({
+            "action": "submit",
+            "actor": username,
+            "time": datetime.now().isoformat(),
+            "detail": "提交公开审核申请",
+        })
+        self.save()
+        self._log_audit("submit_prompt", "prompt", prompt_id, "申请公开")
+        return True, "已提交公开审核，请等待管理员批准", prompt
+
+    def approve_prompt_public(self, prompt_id: str, comment: str = "") -> Tuple[bool, str, Optional[Dict]]:
+        """管理员批准提示词公开。"""
+        username = self.config.get("username", "anonymous")
+        if username != "admin":
+            return False, "只有管理员可以批准", None
+        prompt = self._get_prompt_raw_unchecked(prompt_id)
+        if not prompt:
+            return False, "提示词不存在", None
+        if prompt.get("approval_status") != "pending_review":
+            return False, f"当前状态={prompt.get('approval_status')}，不是待审核状态", None
+        prompt["approval_status"] = "approved"
+        prompt["is_public"] = True
+        prompt["rejection_reason"] = None
+        prompt["approval_history"].append({
+            "action": "approve",
+            "actor": username,
+            "time": datetime.now().isoformat(),
+            "detail": f"管理员批准公开 {comment}",
+        })
+        self.save()
+        self._log_audit("approve_prompt", "prompt", prompt_id, comment or "管理员批准")
+        return True, "提示词已批准公开，已进入公共广场", prompt
+
+    def reject_prompt_public(self, prompt_id: str, reason: str) -> Tuple[bool, str, Optional[Dict]]:
+        """管理员拒绝提示词公开申请。"""
+        username = self.config.get("username", "anonymous")
+        if username != "admin":
+            return False, "只有管理员可以拒绝", None
+        prompt = self._get_prompt_raw_unchecked(prompt_id)
+        if not prompt:
+            return False, "提示词不存在", None
+        if prompt.get("approval_status") != "pending_review":
+            return False, f"当前状态={prompt.get('approval_status')}，不是待审核状态", None
+        prompt["approval_status"] = "rejected"
+        prompt["is_public"] = False
+        prompt["rejection_reason"] = reason
+        prompt["approval_history"].append({
+            "action": "reject",
+            "actor": username,
+            "time": datetime.now().isoformat(),
+            "detail": f"管理员拒绝: {reason}",
+        })
+        self.save()
+        self._log_audit("reject_prompt", "prompt", prompt_id, reason)
+        return True, f"已拒绝公开：{reason}，提示词退回私有状态", prompt
+
+    # 重写 list_prompts 过滤 pending_review 和 rejected（对非作者/非admin不可见）
+    def list_prompts(self, page: int = 1, page_size: int = 10,
+                     category: Optional[str] = None,
+                     author: Optional[str] = None,
+                     tag: Optional[str] = None,
+                     sort_by: str = "popular",
+                     mine_only: bool = False,
+                     only_favorites: bool = False,
+                     only_public: bool = False,
+                     status_filter: Optional[str] = None) -> Tuple[List[Dict[str, Any]], int]:
+        """列表：权限过滤+审核状态过滤。"""
+        username = self.config.get("username", "anonymous")
+        prompts = list(self._prompts)
+
+        # --- 权限过滤 ---
+        filtered = []
+        for p in prompts:
+            is_owner = p["author"] == username
+            approval = p.get("approval_status", "approved")
+            # 作者本人和admin：全部可见（含pending/rejected）
+            if is_owner or username == "admin":
+                pass  # 都能看
+            # 其他人：只有 approval_status=approved 的才显示
+            elif approval != "approved":
+                continue
+            # approval_status 正常的公开提示词：再判断 is_public
+            if not only_public:
+                pass
+            filtered.append(p)
+
+        # 作者筛选（可以和权限过滤组合使用：比如 status=pending 只看自己/管理员）
+        if author:
+            filtered = [p for p in filtered if p["author"] == author]
+
+        # 审核状态筛选（只在非mine_only时过滤公共列表，mine时保留全部状态）
+        if status_filter == "pending_review":
+            filtered = [p for p in filtered if p.get("approval_status") == "pending_review"]
+        elif status_filter == "rejected":
+            filtered = [p for p in filtered if p.get("approval_status") == "rejected"]
+        elif status_filter == "approved":
+            filtered = [p for p in filtered if p.get("approval_status") == "approved"]
+
+        # 只看我的
+        if mine_only:
+            filtered = [p for p in filtered if p["author"] == username]
+
+        # 只看收藏
+        if only_favorites:
+            profile = self._get_user_profile()
+            fav_ids = set(profile["favorites"].get("prompts", []))
+            filtered = [p for p in filtered if p["id"] in fav_ids]
+
+        # 只看公开
+        if only_public:
+            filtered = [p for p in filtered if p.get("is_public", True)]
+
+        if category:
+            filtered = [p for p in filtered if p.get("category") == category]
+        if tag:
+            filtered = [p for p in filtered if tag in p.get("tags", [])]
+
+        def sort_key(p: Dict[str, Any]) -> Any:
+            if sort_by == "latest":
+                return p.get("created_at", "")
+            elif sort_by == "rating":
+                return p.get("rating", 0)
+            else:  # popular
+                return p.get("usage_count", 0)
+
+        filtered.sort(key=sort_key, reverse=(sort_by != "oldest"))
+
+        total = len(filtered)
+        start = (page - 1) * page_size
+        result = filtered[start:start + page_size]
+        for r in result:
+            self._inject_user_view_flags(r, "prompt")
+        return result, total
+
+    # 重写 get_prompt：非作者/非admin的pending/rejected返回None拦截
+    def get_prompt(self, prompt_id: str) -> Optional[Dict[str, Any]]:
+        prompt = self._get_prompt_raw_unchecked(prompt_id)
+        if not prompt:
+            return None
+        username = self.config.get("username", "anonymous")
+        is_owner = prompt["author"] == username
+        approval = prompt.get("approval_status", "approved")
+        # 非作者非管理员：pending/rejected 假装不存在
+        if not is_owner and username != "admin" and approval != "approved":
+            return None
+        # 非作者非管理员：私有 也假装不存在（原有逻辑）
+        if not is_owner and not prompt.get("is_public", True):
+            return None
+        result = prompt.copy()
+        self._inject_user_view_flags(result, "prompt")
+        return result
+
+    # ============ 备份管理 ============
+    def create_backup(self, reason: str = "手动备份") -> Tuple[bool, str, str]:
+        """手动创建备份：写入cache独立条目。"""
+        username = self.config.get("username", "anonymous")
+        cache = self.config.load_cache()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_key = f"backup_{ts}_{username}"
+        payload = {
+            "_meta": {
+                "backup_key": backup_key,
+                "created_at": datetime.now().isoformat(),
+                "created_by": username,
+                "reason": reason,
+                "schema_version": self.CACHE_KEY,
+            },
+            "posts": json.loads(json.dumps(self._posts)),
+            "drafts": json.loads(json.dumps(self._drafts)),
+            "prompts": json.loads(json.dumps(self._prompts)),
+            "notifications": json.loads(json.dumps(self._notifications)),
+            "comments": json.loads(json.dumps(self._comments)),
+            "activities": json.loads(json.dumps(self._activities)),
+            "audit_logs": json.loads(json.dumps(self._audit_logs)),
+            "user_profiles": json.loads(json.dumps(self._user_profiles)),
+        }
+        cache[backup_key] = payload
+        self.config.save_cache(cache)
+        self._log_audit("backup", "backup", backup_key, reason)
+        # 重新从磁盘读保证一致性
+        return True, backup_key, f"备份完成（key={backup_key}）"
+
+    def list_backups(self) -> List[Dict[str, Any]]:
+        """列出所有备份：backup_* 或 v1_backup_* 开头。"""
+        cache = self.config.load_cache()
+        backups = []
+        for key, val in cache.items():
+            if key.startswith("backup_") or (key.startswith("aicommunity_state_v1_backup_")):
+                meta = val.get("_meta", {}) if isinstance(val, dict) else {}
+                backups.append({
+                    "key": key,
+                    "created_at": meta.get("created_at",
+                                            datetime.fromtimestamp(
+                                                int(key.split("_")[-1]) if key.rsplit("_",1)[-1].isdigit() else time.time()
+                                            ).isoformat() if "_v1_backup_" in key else "N/A"),
+                    "created_by": meta.get("created_by", "system"),
+                    "reason": meta.get("reason", "v1迁移备份" if "_v1_backup_" in key else "未知"),
+                    "schema": meta.get("schema_version", "v1" if "_v1_backup_" in key else "?"),
+                    "posts_count": len(val.get("posts", val)) if "_v1_backup_" not in key else len(val.get("posts", [])),
+                    "drafts_count": len(val.get("drafts", [])) if isinstance(val, dict) else 0,
+                    "prompts_count": len(val.get("prompts", [])) if isinstance(val, dict) else 0,
+                })
+        backups.sort(key=lambda b: b["created_at"], reverse=True)
+        return backups
+
+    def get_backup_info(self, backup_key: str) -> Optional[Dict[str, Any]]:
+        """查看备份详细信息。"""
+        cache = self.config.load_cache()
+        backup = cache.get(backup_key)
+        if backup is None:
+            return None
+        meta = backup.get("_meta", None) if isinstance(backup, dict) else None
+        if meta:  # 新格式 v2 backup_*
+            return {
+                "key": backup_key,
+                "meta": meta,
+                "posts_count": len(backup.get("posts", [])),
+                "drafts_count": len(backup.get("drafts", [])),
+                "prompts_count": len(backup.get("prompts", [])),
+                "notifications_count": len(backup.get("notifications", [])),
+                "user_profiles": list(backup.get("user_profiles", {}).keys()),
+                "audit_logs_count": len(backup.get("audit_logs", [])),
+            }
+        else:  # 旧格式 v1
+            return {
+                "key": backup_key,
+                "meta": {"created_by": "system", "reason": "v1自动迁移备份", "schema_version": "v1"},
+                "posts_count": len(backup.get("posts", [])),
+                "drafts_count": len(backup.get("drafts", [])),
+                "prompts_count": len(backup.get("prompts", [])),
+                "user_profiles": ["(writer默认，需迁移)"],
+                "audit_logs_count": 0,
+            }
+
+    def restore_backup(self, backup_key: str) -> Tuple[bool, str]:
+        """从备份恢复。"""
+        username = self.config.get("username", "anonymous")
+        cache = self.config.load_cache()
+        backup = cache.get(backup_key)
+        if backup is None:
+            return False, f"备份 {backup_key} 不存在"
+        # 恢复前先做一个即时备份
+        pre_restore_key = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{username}_pre_restore"
+        cache[pre_restore_key] = {
+            "_meta": {
+                "backup_key": pre_restore_key,
+                "created_at": datetime.now().isoformat(),
+                "created_by": username,
+                "reason": f"恢复{backup_key}前自动备份",
+                "schema_version": self.CACHE_KEY,
+            },
+            "posts": json.loads(json.dumps(self._posts)),
+            "drafts": json.loads(json.dumps(self._drafts)),
+            "prompts": json.loads(json.dumps(self._prompts)),
+            "notifications": json.loads(json.dumps(self._notifications)),
+            "comments": json.loads(json.dumps(self._comments)),
+            "activities": json.loads(json.dumps(self._activities)),
+            "audit_logs": json.loads(json.dumps(self._audit_logs)),
+            "user_profiles": json.loads(json.dumps(self._user_profiles)),
+        }
+
+        # v1 备份需要走迁移逻辑：新建 v2 结构
+        if "_meta" not in backup or backup["_meta"].get("schema_version") != self.CACHE_KEY:
+            self._user_profiles = {}
+            self._migrate_v1_to_v2(backup, cache)
+            self.save()
+            self._log_audit("restore", "backup", backup_key, f"v1迁移恢复v2，恢复前备份={pre_restore_key}")
+            return True, f"v1备份恢复成功（已迁移到v2），恢复前备份key={pre_restore_key}"
+
+        # v2 直接恢复
+        self._posts = json.loads(json.dumps(backup["posts"]))
+        self._drafts = json.loads(json.dumps(backup["drafts"]))
+        self._prompts = json.loads(json.dumps(backup["prompts"]))
+        self._notifications = json.loads(json.dumps(backup["notifications"]))
+        self._comments = json.loads(json.dumps(backup["comments"]))
+        self._activities = json.loads(json.dumps(backup["activities"]))
+        self._audit_logs = json.loads(json.dumps(backup["audit_logs"]))
+        self._user_profiles = json.loads(json.dumps(backup["user_profiles"]))
+        self.save()
+        # 重新从cache读，写入self._log_audit
+        self._log_audit("restore", "backup", backup_key, f"v2直接恢复，恢复前备份={pre_restore_key}")
+        self.config.save_cache(cache)  # 恢复前备份也保存
+        return True, f"恢复成功，恢复前备份key={pre_restore_key}"

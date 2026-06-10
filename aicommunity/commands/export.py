@@ -359,3 +359,56 @@ def export_activity_csv(ctx, output, months):
         console.print(f"[dim]文件大小: {file_size / 1024:.1f} KB[/dim]")
     except IOError as e:
         console.print(f"[red]错误：导出失败 ({e})[/red]")
+
+
+@export.command("audit")
+@click.option("-o", "--output", type=click.Path(), help="输出目录（默认 ~/.aicommunity/exports）")
+@click.option("-f", "--format", "fmt", type=click.Choice(["csv", "json"]), default="csv", show_default=True)
+@click.option("-d", "--days", type=int, help="最近N天的操作记录")
+@click.option("--from", "from_date", help="起始日期 YYYY-MM-DD")
+@click.option("--to", "to_date", help="结束日期 YYYY-MM-DD")
+@click.option("--action", "actions", multiple=True,
+              type=click.Choice(["like","unlike","favorite","unfavorite","follow","unfollow",
+                                 "create_post","transfer_draft","approve_draft","reject_draft","comment_draft",
+                                 "submit_prompt","approve_prompt","reject_prompt","backup","restore"]),
+              help="只导出指定动作类型（可多次--action）")
+@click.pass_context
+def export_audit(ctx, output, fmt, days, from_date, to_date, actions):
+    """导出当前用户的操作审计日志。
+
+    每个账号只看到自己的记录，支持按时间和动作筛选。
+
+    示例:\n
+        aicomm export audit -d 30                              # 最近30天操作\n
+        aicomm export audit --action like --action favorite -f json\n
+        aicomm export audit --from 2026-06-01 --to 2026-06-10
+    """
+    config: ConfigManager = ctx.obj["config"]
+    auth = AuthManager(config)
+    if not auth.require_login():
+        return
+
+    client = APIClient(config)
+
+    export_dir = output or config.export_dir
+    action_list = list(actions) if actions else None
+
+    count, filepath = client.export_audit(
+        export_dir, format_type=fmt, actions=action_list,
+        days=days, from_date=from_date, to_date=to_date,
+    )
+    if count == 0:
+        console.print("[yellow]当前筛选条件下没有操作记录[/yellow]")
+        return
+
+    file_size = os.path.getsize(filepath)
+    size_str = f"{file_size/1024:.1f}KB" if file_size < 1024*1024 else f"{file_size/(1024*1024):.1f}MB"
+    console.print()
+    console.print(Panel.fit(
+        f"[green]✓ 审计日志导出成功！[/green]\n\n"
+        f"[cyan]记录数量:[/cyan] {count} 条\n"
+        f"[cyan]文件路径:[/cyan] {filepath}\n"
+        f"[cyan]文件大小:[/cyan] {size_str}\n"
+        f"[cyan]格式:[/cyan] {fmt.upper()}",
+        title="审计导出", border_style="green",
+    ))

@@ -3,6 +3,7 @@
 提供与社区服务端交互的接口，包含模拟数据用于演示。
 """
 
+import csv
 import json
 import os
 import time
@@ -127,9 +128,21 @@ MOCK_DRAFTS: List[Dict[str, Any]] = [
         "created_at": (datetime.now() - timedelta(days=5)).isoformat(),
         "updated_at": (datetime.now() - timedelta(days=1)).isoformat(),
         "synced_at": (datetime.now() - timedelta(days=1)).isoformat(),
-        "status": "reviewing",
+        "status": "transferred",
         "is_local": True,
         "is_synced": True,
+        "reviewer": "admin",
+        "review_comments": [
+            {"id": "rc_001", "reviewer": "admin", "comment": "架构章节讲得不错，数据治理部分请补充更多实战案例。",
+             "created_at": (datetime.now() - timedelta(hours=8)).isoformat()}
+        ],
+        "audit_history": [
+            {"action": "create", "actor": "writer", "time": (datetime.now() - timedelta(days=5)).isoformat(), "detail": "创建草稿"},
+            {"action": "edit", "actor": "writer", "time": (datetime.now() - timedelta(days=2)).isoformat(), "detail": "更新正文"},
+            {"action": "submit_for_review", "actor": "writer", "time": (datetime.now() - timedelta(days=1)).isoformat(), "detail": "提交审核"},
+            {"action": "transfer", "actor": "writer", "time": (datetime.now() - timedelta(hours=10)).isoformat(),
+             "detail": "转让审阅给admin"},
+        ],
     },
     {
         "id": "draft_002",
@@ -146,6 +159,11 @@ MOCK_DRAFTS: List[Dict[str, Any]] = [
         "status": "draft",
         "is_local": True,
         "is_synced": False,
+        "reviewer": None,
+        "review_comments": [],
+        "audit_history": [
+            {"action": "create", "actor": "demo", "time": (datetime.now() - timedelta(days=3)).isoformat(), "detail": "创建草稿"},
+        ],
     },
 ]
 
@@ -442,11 +460,28 @@ class APIClient:
                     "summary": d.get("summary", ""),
                     "created_at": d.get("created_at", datetime.now().isoformat()),
                 }]
+            if "reviewer" not in d:
+                d["reviewer"] = None
+            if "review_comments" not in d:
+                d["review_comments"] = []
+            if "audit_history" not in d:
+                d["audit_history"] = [{
+                    "action": "create",
+                    "actor": d.get("author", ""),
+                    "time": d.get("created_at", datetime.now().isoformat()),
+                    "detail": "创建草稿（迁移补全）",
+                }]
 
         # 给每个提示词补 is_public 字段（默认 True）
         for p in self._prompts:
             if "is_public" not in p:
                 p["is_public"] = True
+            if "approval_status" not in p:
+                p["approval_status"] = "approved" if p.get("is_public") else "none"
+            if "rejection_reason" not in p:
+                p["rejection_reason"] = None
+            if "approval_history" not in p:
+                p["approval_history"] = []
             if "is_favorited" in p:
                 del p["is_favorited"]  # 移除废弃字段，改用user_profiles存储
 
@@ -465,6 +500,7 @@ class APIClient:
         # 同步给 admin 和 demo 用户默认空结构，避免切换时报无版本问题
         self._get_user_profile("admin")
         self._get_user_profile("demo")
+        self._audit_logs = []
 
         # 保存备份key提示
         self.config.set("last_migration_backup", backup_key)
@@ -494,6 +530,7 @@ class APIClient:
             self._notifications = state.get("notifications", [])
             self._comments = state.get("comments", {})
             self._activities = state.get("activities", [])
+            self._audit_logs = state.get("audit_logs", [])
             # 按用户隔离的数据
             self._user_profiles = state.get("user_profiles", {})
             return
@@ -516,6 +553,20 @@ class APIClient:
                     "summary": d.get("summary", ""),
                     "created_at": d.get("created_at", datetime.now().isoformat()),
                 }]
+            if "reviewer" not in d:
+                d["reviewer"] = None
+            if "review_comments" not in d:
+                d["review_comments"] = []
+            if "audit_history" not in d:
+                d["audit_history"] = []
+
+        for p in self._prompts:
+            if "approval_status" not in p:
+                p["approval_status"] = "approved" if p.get("is_public") else "none"
+            if "rejection_reason" not in p:
+                p["rejection_reason"] = None
+            if "approval_history" not in p:
+                p["approval_history"] = []
 
         # 按用户隔离：默认writer用户有一些初始状态（匹配MOCK数据）
         self._user_profiles: Dict[str, Dict[str, Any]] = {}
@@ -532,6 +583,7 @@ class APIClient:
         admin_profile["read_notifications"] = []
 
         self._get_user_profile("demo")
+        self._audit_logs = []
         self.save()
 
     def save(self) -> None:
@@ -545,6 +597,7 @@ class APIClient:
             "notifications": self._notifications,
             "comments": self._comments,
             "activities": self._activities,
+            "audit_logs": self._audit_logs,
             # 按用户隔离数据
             "user_profiles": self._user_profiles,
         }
@@ -589,6 +642,7 @@ class APIClient:
         self._add_activity(username, user_info.get("display_name", username), user_info.get("avatar", "👤"),
                           "发布了新帖子", content[:30] + "..." if len(content) > 30 else content, "post", new_post["id"])
         self.save()
+        self._log_audit("create_post", "post", new_post["id"], f"发布帖子，标签={tags or []}")
         return new_post
 
     def list_posts(self, page: int = 1, page_size: int = 20, author: Optional[str] = None,
@@ -636,10 +690,15 @@ class APIClient:
         if liked:
             profile["liked_posts"].remove(post_id)
             post["likes"] = max(0, post.get("likes", 0) - 1)
+            action = "unlike"
+            msg = "取消点赞"
         else:
             profile["liked_posts"].append(post_id)
             post["likes"] = post.get("likes", 0) + 1
+            action = "like"
+            msg = "点赞"
         self.save()
+        self._log_audit(action, "post", post_id, msg)
         return True
 
     # ==================== 草稿相关 ====================
@@ -1103,6 +1162,7 @@ class APIClient:
             self._add_activity(current_user, current_info.get("display_name", current_user),
                               current_info.get("avatar", "👤"), "关注了", info["display_name"], "user", username_to_follow)
             self.save()
+            self._log_audit("follow", "user", username_to_follow, f"关注了{info['display_name']}")
             return follow_info
         return None
 
@@ -1113,6 +1173,7 @@ class APIClient:
             if f["username"] == username:
                 del profile["following"][i]
                 self.save()
+                self._log_audit("unfollow", "user", username, f"取消关注{f.get('display_name', username)}")
                 return True
         return False
 
@@ -1279,6 +1340,8 @@ class APIClient:
                 prompt["favorites"] = max(0, prompt.get("favorites", 0) + (1 if favorited else -1))
 
         self.save()
+        action_name = "favorite" if favorited else "unfavorite"
+        self._log_audit(action_name, content_type, content_id, msg)
         return True, favorited, msg
 
     def list_favorites(self, content_type: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
@@ -1524,3 +1587,374 @@ class APIClient:
 
             return filepath
         return None
+
+
+    # ============ 操作审计日志 ============
+    def _log_audit(self, action, target_type, target_id='', detail=''):
+        username = self.config.get('username', 'anonymous')
+        log_entry = {
+            'id': 'audit_' + str(int(time.time())) + '_' + str(len(self._audit_logs)+1).zfill(4),
+            'timestamp': datetime.now().isoformat(),
+            'user': username,
+            'action': action,
+            'target_type': target_type,
+            'target_id': target_id,
+            'detail': detail,
+            'ip': '127.0.0.1',
+        }
+        self._audit_logs.append(log_entry)
+        self.save()
+
+    def export_audit(self, output_dir, format_type='csv', actions=None, days=None, from_date=None, to_date=None):
+        username = self.config.get('username', 'anonymous')
+        logs = [l for l in self._audit_logs if l['user'] == username]
+        if actions:
+            logs = [l for l in logs if l['action'] in actions]
+        now = datetime.now()
+        cutoff = now - timedelta(days=days) if days else None
+        start_dt = datetime.fromisoformat(from_date) if from_date else None
+        end_dt = datetime.fromisoformat(to_date) if to_date else None
+        if cutoff or start_dt or end_dt:
+            filtered = []
+            for l in logs:
+                lt = datetime.fromisoformat(l['timestamp'])
+                if cutoff and lt < cutoff: continue
+                if start_dt and lt < start_dt: continue
+                if end_dt and lt > end_dt: continue
+                filtered.append(l)
+            logs = filtered
+        os.makedirs(output_dir, exist_ok=True)
+        ts = now.strftime('%Y%m%d_%H%M%S')
+        if format_type == 'json':
+            fn = 'audit_logs_' + ts + '.json'
+            fp = os.path.join(output_dir, fn)
+            with open(fp, 'w', encoding='utf-8') as f:
+                json.dump(logs, f, ensure_ascii=False, indent=2)
+        else:
+            fn = 'audit_logs_' + ts + '.csv'
+            fp = os.path.join(output_dir, fn)
+            with open(fp, 'w', encoding='utf-8-sig', newline='') as f:
+                w = csv.writer(f)
+                w.writerow(['审计ID','时间','操作人','动作','对象类型','对象ID','详情','IP'])
+                for l in logs:
+                    w.writerow([l['id'], l['timestamp'], l['user'], l['action'], l['target_type'], l['target_id'], l['detail'], l['ip']])
+        return len(logs), fp
+
+    # ============ 草稿协作流转 ============
+    def transfer_draft(self, draft_id, reviewer, note=''):
+        from .auth import MOCK_USERS_DB
+        username = self.config.get('username', 'anonymous')
+        draft = self.get_draft(draft_id)
+        if not draft: return False, '草稿不存在', None
+        if draft['author'] != username: return False, '只有作者本人可以转让审阅', None
+        if reviewer not in MOCK_USERS_DB: return False, '审阅人 ' + reviewer + ' 不存在', None
+        draft['reviewer'] = reviewer
+        draft['status'] = 'transferred'
+        if 'review_comments' not in draft: draft['review_comments'] = []
+        if 'audit_history' not in draft: draft['audit_history'] = []
+        if note:
+            draft['review_comments'].append({
+                'id': 'rc_' + str(int(time.time())),
+                'reviewer': username, 'comment': note,
+                'created_at': datetime.now().isoformat(),
+            })
+        draft['audit_history'].append({'action': 'transfer', 'actor': username, 'time': datetime.now().isoformat(),
+                                       'detail': '转让审阅给 ' + reviewer + ((': '+note) if note else '')})
+        self.save()
+        self._log_audit('transfer_draft', 'draft', draft_id, 'reviewer=' + reviewer)
+        return True, '已转让给' + MOCK_USERS_DB[reviewer]['display_name'] + '审阅', draft
+
+    def review_draft(self, draft_id, action, comment='', reason=''):
+        username = self.config.get('username', 'anonymous')
+        draft = self.get_draft(draft_id)
+        if not draft: return False, '草稿不存在', None
+        if draft.get('reviewer') != username:
+            return False, '只有当前审阅人（' + str(draft.get('reviewer','未指定')) + '）可审阅此草稿', None
+        if 'review_comments' not in draft: draft['review_comments'] = []
+        if 'audit_history' not in draft: draft['audit_history'] = []
+        if comment:
+            draft['review_comments'].append({'id': 'rc_'+str(int(time.time())), 'reviewer': username, 'comment': comment,
+                                             'created_at': datetime.now().isoformat()})
+        if action == 'comment':
+            draft['audit_history'].append({'action':'review_comment','actor':username,'time':datetime.now().isoformat(),
+                                           'detail':'添加批注: '+comment[:50]})
+            self.save()
+            self._log_audit('comment_draft', 'draft', draft_id, comment[:80])
+            return True, '批注已添加', draft
+        if action == 'approve':
+            draft['status'] = 'approved'
+            draft['audit_history'].append({'action':'approve','actor':username,'time':datetime.now().isoformat(),
+                                           'detail':'批准发布'})
+            self.save()
+            self._log_audit('approve_draft', 'draft', draft_id, comment[:80] or '批准发布')
+            return True, '草稿已批准，可提交发布', draft
+        if action == 'reject':
+            draft['status'] = 'rejected'
+            if reason:
+                draft['review_comments'].append({'id':'rc_'+str(int(time.time())),'reviewer':username,
+                                                 'comment':'【退回原因】'+reason,
+                                                 'created_at':datetime.now().isoformat()})
+            draft['audit_history'].append({'action':'reject','actor':username,'time':datetime.now().isoformat(),
+                                           'detail':'退回: '+(reason or comment)[:80]})
+            self.save()
+            self._log_audit('reject_draft', 'draft', draft_id, reason or comment)
+            return True, '已退回草稿：'+(reason or comment), draft
+        return False, 'action 必须是 approve/reject/comment 之一', None
+
+    def list_drafts(self, page=1, page_size=20, status=None, author=None, category=None, days=None,
+                    from_date=None, to_date=None, only_local=False, mine_only=False, perspective=None):
+        username = self.config.get('username', 'anonymous')
+        drafts = list(self._drafts)
+        if perspective == 'pending_me':
+            drafts = [d for d in drafts if d.get('reviewer') == username and d.get('status') == 'transferred']
+        elif perspective == 'my_initiated':
+            drafts = [d for d in drafts if d['author'] == username]
+        elif perspective == 'rejected_to_me':
+            drafts = [d for d in drafts if d['author'] == username and d.get('status') == 'rejected']
+        elif perspective == 'rejected':
+            drafts = [d for d in drafts if d.get('status') == 'rejected']
+        elif perspective == 'transferred':
+            drafts = [d for d in drafts if d.get('status') == 'transferred']
+        elif perspective == 'approved':
+            drafts = [d for d in drafts if d.get('status') == 'approved']
+        if mine_only:
+            drafts = [d for d in drafts if d['author'] == username]
+        if status: drafts = [d for d in drafts if d.get('status') == status]
+        if author: drafts = [d for d in drafts if d.get('author') == author]
+        if category: drafts = [d for d in drafts if d.get('category') == category]
+        if days:
+            cutoff = datetime.now() - timedelta(days=days)
+            drafts = [d for d in drafts if datetime.fromisoformat(d['updated_at']) >= cutoff]
+        if from_date:
+            sd = datetime.fromisoformat(from_date)
+            drafts = [d for d in drafts if datetime.fromisoformat(d['updated_at']) >= sd]
+        if to_date:
+            ed = datetime.fromisoformat(to_date)
+            drafts = [d for d in drafts if datetime.fromisoformat(d['updated_at']) <= ed]
+        if only_local: drafts = [d for d in drafts if not d.get('is_synced', False)]
+        total = len(drafts)
+        start = (page - 1) * page_size
+        return drafts[start:start+page_size], total
+
+    # ============ 提示词发布审核 ============
+    def submit_prompt_for_approval(self, prompt_id):
+        username = self.config.get('username', 'anonymous')
+        prompt = self._get_prompt_raw_unchecked(prompt_id)
+        if not prompt: return False, '提示词不存在', None
+        if prompt['author'] != username: return False, '只有作者本人可以申请公开', None
+        if prompt.get('approval_status') == 'approved': return False, '提示词已经是公开状态，无需再次申请', None
+        if 'approval_history' not in prompt: prompt['approval_history'] = []
+        prompt['approval_status'] = 'pending_review'
+        prompt['rejection_reason'] = None
+        prompt['approval_history'].append({'action':'submit','actor':username,'time':datetime.now().isoformat(),
+                                            'detail':'提交公开审核申请'})
+        self.save()
+        self._log_audit('submit_prompt', 'prompt', prompt_id, '申请公开')
+        return True, '已提交公开审核，请等待管理员批准', prompt
+
+    def approve_prompt_public(self, prompt_id, comment=''):
+        username = self.config.get('username', 'anonymous')
+        if username != 'admin': return False, '只有管理员可以批准', None
+        prompt = self._get_prompt_raw_unchecked(prompt_id)
+        if not prompt: return False, '提示词不存在', None
+        if prompt.get('approval_status') != 'pending_review':
+            return False, '当前状态=' + str(prompt.get('approval_status')) + '，不是待审核状态', None
+        if 'approval_history' not in prompt: prompt['approval_history'] = []
+        prompt['approval_status'] = 'approved'
+        prompt['is_public'] = True
+        prompt['rejection_reason'] = None
+        prompt['approval_history'].append({'action':'approve','actor':username,'time':datetime.now().isoformat(),
+                                            'detail':'管理员批准公开 '+comment})
+        self.save()
+        self._log_audit('approve_prompt', 'prompt', prompt_id, comment or '管理员批准')
+        return True, '提示词已批准公开，已进入公共广场', prompt
+
+    def reject_prompt_public(self, prompt_id, reason):
+        username = self.config.get('username', 'anonymous')
+        if username != 'admin': return False, '只有管理员可以拒绝', None
+        prompt = self._get_prompt_raw_unchecked(prompt_id)
+        if not prompt: return False, '提示词不存在', None
+        if prompt.get('approval_status') != 'pending_review':
+            return False, '当前状态=' + str(prompt.get('approval_status')) + '，不是待审核状态', None
+        if 'approval_history' not in prompt: prompt['approval_history'] = []
+        prompt['approval_status'] = 'rejected'
+        prompt['is_public'] = False
+        prompt['rejection_reason'] = reason
+        prompt['approval_history'].append({'action':'reject','actor':username,'time':datetime.now().isoformat(),
+                                            'detail':'管理员拒绝: '+reason})
+        self.save()
+        self._log_audit('reject_prompt', 'prompt', prompt_id, reason)
+        return True, '已拒绝公开：' + reason + '，提示词退回私有状态', prompt
+
+    def list_prompts(self, page=1, page_size=10, category=None, author=None, tag=None, sort_by='popular',
+                     mine_only=False, only_favorites=False, only_public=False, status_filter=None):
+        username = self.config.get('username', 'anonymous')
+        prompts = list(self._prompts)
+        filtered = []
+        for p in prompts:
+            is_owner = p['author'] == username
+            approval = p.get('approval_status', 'approved')
+            if not (is_owner or username == 'admin') and approval != 'approved':
+                continue
+            filtered.append(p)
+        if author: filtered = [p for p in filtered if p['author'] == author]
+        if status_filter == 'pending_review':
+            filtered = [p for p in filtered if p.get('approval_status') == 'pending_review']
+        elif status_filter == 'rejected':
+            filtered = [p for p in filtered if p.get('approval_status') == 'rejected']
+        elif status_filter == 'approved':
+            filtered = [p for p in filtered if p.get('approval_status') == 'approved']
+        if mine_only: filtered = [p for p in filtered if p['author'] == username]
+        if only_favorites:
+            profile = self._get_user_profile()
+            fav_ids = set(profile['favorites'].get('prompts', []))
+            filtered = [p for p in filtered if p['id'] in fav_ids]
+        if only_public: filtered = [p for p in filtered if p.get('is_public', True)]
+        if category: filtered = [p for p in filtered if p.get('category') == category]
+        if tag: filtered = [p for p in filtered if tag in p.get('tags', [])]
+        def sort_key(p):
+            if sort_by == 'latest': return p.get('created_at', '')
+            elif sort_by == 'rating': return p.get('rating', 0)
+            else: return p.get('usage_count', 0)
+        filtered.sort(key=sort_key, reverse=(sort_by != 'oldest'))
+        total = len(filtered)
+        start = (page-1) * page_size
+        result = filtered[start:start+page_size]
+        for r in result: self._inject_user_view_flags(r, 'prompt')
+        return result, total
+
+    def get_prompt(self, prompt_id):
+        prompt = self._get_prompt_raw_unchecked(prompt_id)
+        if not prompt: return None
+        username = self.config.get('username', 'anonymous')
+        is_owner = prompt['author'] == username
+        approval = prompt.get('approval_status', 'approved')
+        if not is_owner and username != 'admin' and approval != 'approved':
+            return None
+        if not is_owner and not prompt.get('is_public', True):
+            return None
+        result = prompt.copy()
+        self._inject_user_view_flags(result, 'prompt')
+        return result
+
+    # ============ 备份管理 ============
+    def create_backup(self, reason='手动备份'):
+        username = self.config.get('username', 'anonymous')
+        cache = self.config.load_cache()
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        backup_key = 'backup_' + ts + '_' + username
+        payload = {
+            '_meta': {
+                'backup_key': backup_key,
+                'created_at': datetime.now().isoformat(),
+                'created_by': username,
+                'reason': reason,
+                'schema_version': self.CACHE_KEY,
+            },
+            'posts': json.loads(json.dumps(self._posts)),
+            'drafts': json.loads(json.dumps(self._drafts)),
+            'prompts': json.loads(json.dumps(self._prompts)),
+            'notifications': json.loads(json.dumps(self._notifications)),
+            'comments': json.loads(json.dumps(self._comments)),
+            'activities': json.loads(json.dumps(self._activities)),
+            'audit_logs': json.loads(json.dumps(self._audit_logs)),
+            'user_profiles': json.loads(json.dumps(self._user_profiles)),
+        }
+        cache[backup_key] = payload
+        self.config.save_cache(cache)
+        self._log_audit('backup', 'backup', backup_key, reason)
+        return True, backup_key, '备份完成（key=' + backup_key + '）'
+
+    def list_backups(self):
+        cache = self.config.load_cache()
+        backups = []
+        for key, val in cache.items():
+            if not (key.startswith('backup_') or key.startswith('aicommunity_state_v1_backup_')):
+                continue
+            meta = val.get('_meta', {}) if isinstance(val, dict) else {}
+            posts_count = len(val.get('posts', [])) if isinstance(val, dict) else 0
+            drafts_count = len(val.get('drafts', [])) if isinstance(val, dict) else 0
+            prompts_count = len(val.get('prompts', [])) if isinstance(val, dict) else 0
+            created_at = meta.get('created_at', 'N/A')
+            created_by = meta.get('created_by', 'system')
+            if key.startswith('aicommunity_state_v1_backup_'):
+                t = key.replace('aicommunity_state_v1_backup_', '')
+                try:
+                    created_at = datetime.fromtimestamp(int(t)).isoformat()
+                except Exception:
+                    created_at = 'N/A'
+            backups.append({
+                'key': key, 'created_at': created_at, 'created_by': created_by,
+                'reason': meta.get('reason', ('v1迁移备份' if '_v1_backup_' in key else '未知')),
+                'schema': meta.get('schema_version', ('v1' if '_v1_backup_' in key else '?')),
+                'posts_count': posts_count, 'drafts_count': drafts_count, 'prompts_count': prompts_count,
+            })
+        backups.sort(key=lambda b: b['created_at'], reverse=True)
+        return backups
+
+    def get_backup_info(self, backup_key):
+        cache = self.config.load_cache()
+        backup = cache.get(backup_key)
+        if backup is None: return None
+        meta = backup.get('_meta') if isinstance(backup, dict) else None
+        if meta:
+            return {
+                'key': backup_key, 'meta': meta,
+                'posts_count': len(backup.get('posts', [])),
+                'drafts_count': len(backup.get('drafts', [])),
+                'prompts_count': len(backup.get('prompts', [])),
+                'notifications_count': len(backup.get('notifications', [])),
+                'user_profiles': list(backup.get('user_profiles', {}).keys()),
+                'audit_logs_count': len(backup.get('audit_logs', [])),
+            }
+        return {
+            'key': backup_key,
+            'meta': {'created_by':'system','reason':'v1自动迁移备份','schema_version':'v1'},
+            'posts_count': len(backup.get('posts', [])),
+            'drafts_count': len(backup.get('drafts', [])),
+            'prompts_count': len(backup.get('prompts', [])),
+            'user_profiles': ['(writer默认，需迁移)'],
+            'audit_logs_count': 0,
+        }
+
+    def restore_backup(self, backup_key):
+        username = self.config.get('username', 'anonymous')
+        cache = self.config.load_cache()
+        backup = cache.get(backup_key)
+        if backup is None: return False, '备份 ' + backup_key + ' 不存在'
+        pre_restore_key = 'backup_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + username + '_pre_restore'
+        cache[pre_restore_key] = {
+            '_meta': {
+                'backup_key': pre_restore_key,
+                'created_at': datetime.now().isoformat(),
+                'created_by': username,
+                'reason': '恢复' + backup_key + '前自动备份',
+                'schema_version': self.CACHE_KEY,
+            },
+            'posts': json.loads(json.dumps(self._posts)),
+            'drafts': json.loads(json.dumps(self._drafts)),
+            'prompts': json.loads(json.dumps(self._prompts)),
+            'notifications': json.loads(json.dumps(self._notifications)),
+            'comments': json.loads(json.dumps(self._comments)),
+            'activities': json.loads(json.dumps(self._activities)),
+            'audit_logs': json.loads(json.dumps(self._audit_logs)),
+            'user_profiles': json.loads(json.dumps(self._user_profiles)),
+        }
+        if '_meta' not in backup or backup['_meta'].get('schema_version') != self.CACHE_KEY:
+            self._user_profiles = {}
+            self._migrate_v1_to_v2(backup, cache)
+            self.save()
+            self._log_audit('restore', 'backup', backup_key, 'v1迁移恢复到v2，恢复前备份=' + pre_restore_key)
+            return True, 'v1备份恢复成功（已迁移到v2），恢复前备份key=' + pre_restore_key
+        self._posts = json.loads(json.dumps(backup['posts']))
+        self._drafts = json.loads(json.dumps(backup['drafts']))
+        self._prompts = json.loads(json.dumps(backup['prompts']))
+        self._notifications = json.loads(json.dumps(backup['notifications']))
+        self._comments = json.loads(json.dumps(backup['comments']))
+        self._activities = json.loads(json.dumps(backup['activities']))
+        self._audit_logs = json.loads(json.dumps(backup['audit_logs']))
+        self._user_profiles = json.loads(json.dumps(backup['user_profiles']))
+        self.save()
+        self._log_audit('restore', 'backup', backup_key, 'v2直接恢复，恢复前备份=' + pre_restore_key)
+        self.config.save_cache(cache)
+        return True, '恢复成功，恢复前备份key=' + pre_restore_key
