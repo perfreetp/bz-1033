@@ -41,13 +41,17 @@ def draft():
 @draft.command("list")
 @click.option("-s", "--status", type=click.Choice(["draft", "reviewing", "published", "rejected"]),
               help="按状态筛选")
+@click.option("-a", "--author", help="按作者用户名筛选")
+@click.option("--sort-by", type=click.Choice(["updated_at", "created_at", "word_count", "title"]),
+              default="updated_at", show_default=True, help="排序字段")
 @click.pass_context
-def list_drafts(ctx, status):
-    """列出我的长文草稿。
+def list_drafts(ctx, status, author, sort_by):
+    """列出长文草稿。
 
     示例:\n
         aicomm draft list\n
-        aicomm draft list -s reviewing
+        aicomm draft list -s reviewing\n
+        aicomm draft list -a writer --sort-by word_count
     """
     config: ConfigManager = ctx.obj["config"]
     auth = AuthManager(config)
@@ -56,7 +60,7 @@ def list_drafts(ctx, status):
 
     client = APIClient(config)
     client.load_local_drafts()
-    drafts = client.list_drafts(status=status)
+    drafts = client.list_drafts(status=status, author=author, sort_by=sort_by)
 
     if not drafts:
         console.print("[yellow]暂无草稿[/yellow]")
@@ -314,6 +318,23 @@ def show(ctx, draft_id):
         border_style="cyan",
     ))
 
+    # 版本记录
+    versions = client.get_draft_versions(draft_id)
+    if versions:
+        table = Table(title="📜 编辑历史版本", header_style="bold magenta", show_lines=False, border_style="dim")
+        table.add_column("版本", justify="center", style="bold", width=8)
+        table.add_column("标题", style="cyan")
+        table.add_column("字数", justify="right", style="yellow")
+        table.add_column("时间", style="dim")
+        for v in versions:
+            table.add_row(
+                f"v{v['version']}",
+                (v.get("title") or "")[:35],
+                f"{len(v.get('content', '')):,} 字",
+                _format_time(v.get("created_at", "")),
+            )
+        console.print(table)
+
 
 @draft.command()
 @click.option("--all", "sync_all", is_flag=True, help="同步所有草稿")
@@ -392,3 +413,57 @@ def export(ctx, draft_id, output, fmt):
         console.print(f"[green]✓ 已导出到: {output}[/green]")
     except IOError as e:
         console.print(f"[red]错误：导出失败 ({e})[/red]")
+
+
+@draft.command()
+@click.argument("draft_id")
+@click.option("-v", "--version", "version", type=int, required=True,
+              help="回滚到哪个版本号（见 draft show 的版本列表）")
+@click.pass_context
+def rollback(ctx, draft_id, version):
+    """回滚草稿到指定历史版本。
+
+    示例:\n
+        aicomm draft rollback draft_001 -v 2\n
+        aicomm draft rollback draft_001 --version 1
+    """
+    config: ConfigManager = ctx.obj["config"]
+    auth = AuthManager(config)
+    if not auth.require_login():
+        return
+
+    client = APIClient(config)
+    draft = client.get_draft(draft_id)
+    if not draft:
+        console.print(f"[red]未找到草稿 {draft_id}[/red]")
+        return
+
+    versions = client.get_draft_versions(draft_id)
+    version_map = {v["version"]: v for v in versions}
+    if version not in version_map:
+        available = ", ".join(str(v["version"]) for v in versions) or "无"
+        console.print(f"[red]错误：版本号 v{version} 不存在，可用版本：{available}[/red]")
+        return
+
+    target = version_map[version]
+    if not click.confirm(
+        f"即将回滚草稿「{draft['title']}」到 v{version}\n"
+        f"  当前版本标题: {draft['title'][:40]}\n"
+        f"  目标版本标题: {target.get('title', '')[:40]}\n"
+        f"  ⚠️  当前内容也会自动保存为新版本\n"
+        "确认继续？"
+    ):
+        return
+
+    result = client.rollback_draft(draft_id, version)
+    if result:
+        console.print()
+        console.print(Panel.fit(
+            f"[green]✓ 已回滚到 v{version}！[/green]\n\n"
+            f"📄 当前标题: {result['title']}\n"
+            f"[cyan]当前字数:[/cyan] {result['word_count']:,} 字\n"
+            f"[cyan]更新时间:[/cyan] {_format_time(result['updated_at'])}\n"
+            f"[dim]💡 原内容已保存为新版本，可以在版本列表中查看[/dim]",
+            title="草稿回滚",
+            border_style="green",
+        ))

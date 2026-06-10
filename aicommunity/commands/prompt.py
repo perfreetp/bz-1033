@@ -39,25 +39,24 @@ def prompt():
 @click.option("--sort", "sort_by", type=click.Choice(["rating", "usage_count", "favorites", "created_at"]),
               default="rating", show_default=True, help="排序方式")
 @click.option("--mine", is_flag=True, help="只看我的提示词")
+@click.option("--favorites", "only_favorites", is_flag=True, help="只看收藏的提示词")
+@click.option("--public-only", is_flag=True, help="只看公开的提示词")
 @click.pass_context
-def list_prompts(ctx, page, size, category, sort_by, mine):
+def list_prompts(ctx, page, size, category, sort_by, mine, only_favorites, public_only):
     """浏览提示词广场。
 
     示例:\n
         aicomm prompt list\n
         aicomm prompt list -c 编程辅助 --sort usage_count\n
-        aicomm prompt list --mine
+        aicomm prompt list --mine --favorites
     """
     config: ConfigManager = ctx.obj["config"]
     client = APIClient(config)
 
-    username = config.get("username") if mine else None
-
-    prompts, total = client.list_prompts(page=page, page_size=size, category=category, sort_by=sort_by)
-
-    if mine and username:
-        prompts = [p for p in prompts if p["author"] == username]
-        total = len(prompts)
+    prompts, total = client.list_prompts(
+        page=page, page_size=size, category=category, sort_by=sort_by,
+        mine_only=mine, only_favorites=only_favorites, only_public=public_only,
+    )
 
     if not prompts:
         console.print("[yellow]暂无提示词[/yellow]")
@@ -325,12 +324,14 @@ def favorite(ctx, prompt_id):
         console.print(f"[red]未找到提示词 {prompt_id}[/red]")
         return
 
-    ok, is_fav = client.toggle_favorite("prompts", prompt_id)
-    if ok:
-        if is_fav:
-            console.print(f"[green]⭐ 已收藏《{prompt['title']}》[/green]")
-        else:
-            console.print(f"[yellow]已取消收藏《{prompt['title']}》[/yellow]")
+    ok, is_fav, msg = client.toggle_favorite("prompts", prompt_id)
+    if not ok:
+        console.print(f"[red]✗ {msg}[/red]")
+        return
+    if is_fav:
+        console.print(f"[green]⭐ 已收藏《{prompt['title']}》（收藏数+1）[/green]")
+    else:
+        console.print(f"[yellow]已取消收藏《{prompt['title']}》（收藏数-1）[/yellow]")
 
 
 @prompt.command("favorites")
@@ -372,3 +373,118 @@ def list_favorites(ctx):
         title=f"我收藏的提示词（共 {len(prompts)} 个）",
         border_style="yellow",
     ))
+
+
+@prompt.command()
+@click.argument("prompt_id")
+@click.option("-t", "--title", help="修改标题")
+@click.option("-c", "--category", type=click.Choice(PROMPT_CATEGORIES), help="修改分类")
+@click.option("-m", "--model", type=click.Choice(MODELS), help="修改适用模型")
+@click.option("--tag", "tags", multiple=True, help="重设标签（多个--tag覆盖原标签）")
+@click.option("-f", "--file", "file_path", type=click.Path(exists=True), help="从文件替换正文")
+@click.option("--public/--private", "is_public", default=None, help="改为公开/私有")
+@click.pass_context
+def edit(ctx, prompt_id, title, category, model, tags, file_path, is_public):
+    """编辑自己上传的提示词。
+
+    示例:\n
+        aicomm prompt edit prompt_001 -t "新标题" --public\n
+        aicomm prompt edit prompt_001 -c 编程辅助 --tag Python --tag AI
+    """
+    config: ConfigManager = ctx.obj["config"]
+    auth = AuthManager(config)
+    if not auth.require_login():
+        return
+
+    client = APIClient(config)
+    prompt = client.get_prompt(prompt_id)
+    if not prompt:
+        console.print(f"[red]未找到提示词 {prompt_id}[/red]")
+        return
+
+    kwargs = {}
+    if title:
+        kwargs["title"] = title
+    if category:
+        kwargs["category"] = category
+    if model:
+        kwargs["model"] = model
+    if tags:
+        kwargs["tags"] = list(tags)
+    if is_public is not None:
+        kwargs["is_public"] = is_public
+    if file_path:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                kwargs["content"] = f.read()
+        except IOError as e:
+            console.print(f"[red]错误：无法读取文件 ({e})[/red]")
+            return
+
+    if not kwargs and not click.confirm("未传入任何修改项，是否打开编辑器修改正文？", default=True):
+        return
+
+    if not kwargs:
+        current = prompt.get("content", "")
+        new_content = click.edit(text=current, extension=".txt") or ""
+        if new_content != current:
+            kwargs["content"] = new_content
+        else:
+            console.print("[yellow]未做任何修改[/yellow]")
+            return
+
+    ok, msg, updated = client.edit_prompt(prompt_id, **kwargs)
+    if not ok:
+        console.print(f"[red]✗ {msg}[/red]")
+        return
+
+    console.print()
+    visibility = "🌐 公开" if updated.get("is_public") else "🔒 私有"
+    changed = ", ".join(kwargs.keys())
+    console.print(Panel.fit(
+        f"[green]✓ {msg}！[/green]\n\n"
+        f"📄 {updated['title']}\n"
+        f"[cyan]修改字段:[/cyan] {changed}\n"
+        f"[cyan]分类:[/cyan] {updated.get('category', '')}\n"
+        f"[cyan]标签:[/cyan] {' '.join('#' + t for t in updated.get('tags', []))}\n"
+        f"[cyan]可见性:[/cyan] {visibility}\n"
+        f"[cyan]更新时间:[/cyan] {_format_time(updated['updated_at'])}",
+        title="编辑提示词",
+        border_style="green",
+    ))
+
+
+@prompt.command()
+@click.argument("prompt_id")
+@click.option("-y", "--yes", is_flag=True, help="跳过确认")
+@click.pass_context
+def delete(ctx, prompt_id, yes):
+    """删除自己上传的提示词。
+
+    示例:\n
+        aicomm prompt delete prompt_001\n
+        aicomm prompt delete prompt_001 -y
+    """
+    config: ConfigManager = ctx.obj["config"]
+    auth = AuthManager(config)
+    if not auth.require_login():
+        return
+
+    client = APIClient(config)
+    prompt = client.get_prompt(prompt_id)
+    if not prompt:
+        console.print(f"[red]未找到提示词 {prompt_id}[/red]")
+        return
+
+    if not yes:
+        if not click.confirm(
+            f"确定删除提示词《{prompt['title']}》？\n"
+            "  ⚠️  删除后所有用户的收藏列表中也会移除，不可恢复"
+        ):
+            return
+
+    ok, msg = client.delete_prompt(prompt_id)
+    if not ok:
+        console.print(f"[red]✗ {msg}[/red]")
+        return
+    console.print(f"[green]✓ {msg} - 《{prompt['title']}》[/green]")

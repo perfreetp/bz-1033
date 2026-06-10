@@ -35,16 +35,17 @@ def export():
               type=click.Choice(["json", "yaml", "markdown"]),
               default="markdown", show_default=True, help="导出格式")
 @click.option("--public-only", is_flag=True, help="只导出公开的提示词")
+@click.option("--favorites", "only_favorites", is_flag=True, help="只导出已收藏的提示词")
 @click.option("-c", "--category", help="按分类筛选导出")
 @click.option("-t", "--tag", "tag_filter", help="按标签筛选导出")
 @click.pass_context
-def export_prompts(ctx, output, fmt, public_only, category, tag_filter):
+def export_prompts(ctx, output, fmt, public_only, only_favorites, category, tag_filter):
     """批量导出我的提示词。
 
     示例:\n
         aicomm export prompts -f markdown\n
         aicomm export prompts -o ./exports -f json -c 编程辅助\n
-        aicomm export prompts --public-only -t Python
+        aicomm export prompts --public-only --favorites -t Python
     """
     config: ConfigManager = ctx.obj["config"]
     auth = AuthManager(config)
@@ -57,7 +58,8 @@ def export_prompts(ctx, output, fmt, public_only, category, tag_filter):
     count, filepath = client.export_prompts(
         output_dir=output_dir,
         format_type=fmt,
-        include_private=not public_only,
+        only_public=public_only,
+        only_favorites=only_favorites,
         category=category,
         tag=tag_filter,
     )
@@ -76,6 +78,8 @@ def export_prompts(ctx, output, fmt, public_only, category, tag_filter):
     filters = []
     if public_only:
         filters.append("仅公开")
+    if only_favorites:
+        filters.append("仅收藏")
     if category:
         filters.append(f"分类={category}")
     if tag_filter:

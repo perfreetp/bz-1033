@@ -281,16 +281,17 @@ def toggle_favorite(ctx, content_type, content_id):
         return
 
     client = APIClient(config)
-    ok, is_fav = client.toggle_favorite(content_type, content_id)
+    ok, is_fav, msg = client.toggle_favorite(content_type, content_id)
 
-    if ok:
-        type_label = {"posts": "帖子", "prompts": "提示词"}.get(content_type, content_type)
-        if is_fav:
-            console.print(f"[green]⭐ 已收藏此{type_label}（{content_id}）[/green]")
-        else:
-            console.print(f"[yellow]已取消收藏此{type_label}（{content_id}）[/yellow]")
+    if not ok:
+        console.print(f"[red]✗ {msg}[/red]")
+        return
+
+    type_label = {"posts": "帖子", "prompts": "提示词"}.get(content_type, content_type)
+    if is_fav:
+        console.print(f"[green]⭐ 已收藏此{type_label}（{content_id}）- 收藏数+1[/green]")
     else:
-        console.print(f"[red]操作失败，请检查内容ID是否正确[/red]")
+        console.print(f"[yellow]已取消收藏此{type_label}（{content_id}）- 收藏数-1[/yellow]")
 
 
 @notify.command("favorites")
