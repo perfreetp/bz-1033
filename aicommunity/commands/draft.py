@@ -41,17 +41,28 @@ def draft():
 @draft.command("list")
 @click.option("-s", "--status", type=click.Choice(["draft", "reviewing", "published", "rejected"]),
               help="按状态筛选")
-@click.option("-a", "--author", help="按作者用户名筛选")
+@click.option("-a", "--author", help="按作者用户名筛选（默认看自己的，传了作者看指定）")
 @click.option("--sort-by", type=click.Choice(["updated_at", "created_at", "word_count", "title"]),
               default="updated_at", show_default=True, help="排序字段")
+@click.option("-d", "--days", type=int, help="按最近N天筛选（按更新时间），例如 --days 7")
+@click.option("--from", "from_date", help="起始日期 YYYY-MM-DD，例如 --from 2026-01-01")
+@click.option("--to", "to_date", help="结束日期 YYYY-MM-DD，例如 --to 2026-06-30")
+@click.option("--only-local", is_flag=True, help="仅显示本地未同步的草稿（is_synced=False）")
+@click.option("--export", "export_path", type=click.Path(),
+              help="将当前筛选结果导出到文件（根据扩展名自动选 .json / .csv）")
+@click.option("-f", "--format", "export_fmt",
+              type=click.Choice(["json", "csv", "markdown"]), default="json", show_default=True,
+              help="导出格式（当--export指定路径时生效）")
 @click.pass_context
-def list_drafts(ctx, status, author, sort_by):
-    """列出长文草稿。
+def list_drafts(ctx, status, author, sort_by, days, from_date, to_date, only_local,
+                export_path, export_fmt):
+    """列出长文草稿，支持多维筛选和结果导出。
 
     示例:\n
         aicomm draft list\n
-        aicomm draft list -s reviewing\n
-        aicomm draft list -a writer --sort-by word_count
+        aicomm draft list -s reviewing -d 7\n
+        aicomm draft list --only-local --from 2026-06-01 --to 2026-06-10\n
+        aicomm draft list -s draft --export ./待处理稿件.csv -f csv
     """
     config: ConfigManager = ctx.obj["config"]
     auth = AuthManager(config)
@@ -60,10 +71,24 @@ def list_drafts(ctx, status, author, sort_by):
 
     client = APIClient(config)
     client.load_local_drafts()
-    drafts = client.list_drafts(status=status, author=author, sort_by=sort_by)
+
+    # 如果显式传了作者，不限制为"我的"
+    mine_only = author is None
+    drafts = client.list_drafts(
+        status=status, author=author, sort_by=sort_by,
+        days=days, from_date=from_date, to_date=to_date,
+        only_local=only_local, mine_only=mine_only,
+    )
 
     if not drafts:
-        console.print("[yellow]暂无草稿[/yellow]")
+        filters_desc = []
+        if status: filters_desc.append(f"状态={status}")
+        if author: filters_desc.append(f"作者={author}")
+        if days: filters_desc.append(f"最近{days}天")
+        if from_date or to_date: filters_desc.append(f"日期:{from_date or '*'}~{to_date or '*'}")
+        if only_local: filters_desc.append("仅本地未同步")
+        hint = f"（筛选条件：{' / '.join(filters_desc)}）" if filters_desc else ""
+        console.print(f"[yellow]暂无草稿[/yellow] {hint}")
         return
 
     table_data = []
@@ -73,6 +98,7 @@ def list_drafts(ctx, status, author, sort_by):
         table_data.append({
             "ID": d["id"],
             "标题": d["title"][:30] + "..." if len(d["title"]) > 30 else d["title"],
+            "作者": d.get("author", ""),
             "分类": d.get("category", "未分类"),
             "字数": f"{d['word_count']:,}",
             f"{icon} 状态": click.style(d["status"], fg=color),
@@ -80,12 +106,109 @@ def list_drafts(ctx, status, author, sort_by):
             "更新时间": _format_time(d["updated_at"]),
         })
 
+    filters_desc = []
+    if status: filters_desc.append(f"状态={status}")
+    if author: filters_desc.append(f"作者={author}")
+    if days: filters_desc.append(f"最近{days}天")
+    if from_date or to_date: filters_desc.append(f"日期:{from_date or '*'}~{to_date or '*'}")
+    if only_local: filters_desc.append("仅本地未同步")
+
+    title = f"草稿列表（共 {len(drafts)} 篇）"
+    if filters_desc:
+        title += f"  [dim]筛选: {' / '.join(filters_desc)}[/dim]"
+
     console.print()
     console.print(Panel.fit(
         tabulate(table_data, headers="keys", tablefmt="rounded_outline"),
-        title=f"我的草稿（共 {len(drafts)} 篇）",
+        title=title,
         border_style="cyan",
     ))
+
+    # 导出筛选结果
+    if export_path:
+        # 自动根据扩展名识别格式
+        ext = os.path.splitext(export_path)[1].lower()
+        fmt = export_fmt
+        if ext == ".csv": fmt = "csv"
+        elif ext in (".json",): fmt = "json"
+        elif ext in (".md", ".markdown"): fmt = "markdown"
+
+        export_dir = os.path.dirname(os.path.abspath(export_path))
+        if not os.path.exists(export_dir):
+            os.makedirs(export_dir, exist_ok=True)
+
+        count = len(drafts)
+        try:
+            if fmt == "json":
+                export_list = []
+                for d in drafts:
+                    export_list.append({
+                        "id": d["id"], "title": d["title"], "author": d.get("author"),
+                        "category": d.get("category"), "tags": d.get("tags", []),
+                        "status": d["status"], "word_count": d["word_count"],
+                        "is_synced": d.get("is_synced", False),
+                        "version_count": len(d.get("versions", [])),
+                        "summary": d.get("summary", ""),
+                        "created_at": d.get("created_at"),
+                        "updated_at": d.get("updated_at"),
+                    })
+                with open(export_path, "w", encoding="utf-8") as f:
+                    json.dump({"filters": {
+                        "status": status, "author": author, "days": days,
+                        "from_date": from_date, "to_date": to_date, "only_local": only_local,
+                    }, "count": count, "items": export_list}, f, ensure_ascii=False, indent=2)
+
+            elif fmt == "csv":
+                import csv
+                headers = ["ID", "标题", "作者", "分类", "状态", "字数", "版本数", "同步", "创建时间", "更新时间", "摘要"]
+                with open(export_path, "w", encoding="utf-8-sig", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(headers)
+                    for d in drafts:
+                        w.writerow([
+                            d["id"], d["title"], d.get("author", ""),
+                            d.get("category", "未分类"), d["status"],
+                            d["word_count"], len(d.get("versions", [])),
+                            "已同步" if d.get("is_synced") else "本地",
+                            d.get("created_at", ""), d.get("updated_at", ""),
+                            (d.get("summary", "") or "")[:100],
+                        ])
+
+            elif fmt == "markdown":
+                lines = [
+                    f"# 稿件清单（{count} 篇）",
+                    "",
+                    f"**导出时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                ]
+                if filters_desc:
+                    lines.append(f"**筛选条件**: {' / '.join(filters_desc)}")
+                lines.append("")
+                lines.append("| ID | 标题 | 分类 | 状态 | 字数 | 版本 | 同步 | 更新时间 |")
+                lines.append("|---|---|---|---|---:|---:|---|---|")
+                for d in drafts:
+                    sync = "☁️ 已同步" if d.get("is_synced") else "💾 本地"
+                    lines.append(
+                        f"| {d['id']} | {d['title'][:40]} | {d.get('category','')} | {d['status']} "
+                        f"| {d['word_count']:,} | {len(d.get('versions',[]))} | {sync} "
+                        f"| {_format_time(d['updated_at'])} |"
+                    )
+                lines.append("")
+                lines.append("## 待处理清单")
+                for i, d in enumerate(drafts, 1):
+                    lines.append(f"### {i}. {d['title']}  ")
+                    lines.append(f"- **ID**: `{d['id']}`  ")
+                    lines.append(f"- **字数**: {d['word_count']:,}  ")
+                    lines.append(f"- **状态**: {STATUS_COLORS.get(d['status'],('?','white'))[0]} {d['status']}  ")
+                    lines.append(f"- **摘要**: {(d.get('summary','') or '')[:200]}  ")
+                    lines.append("")
+                with open(export_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines))
+
+            file_size = os.path.getsize(export_path)
+            size_str = f"{file_size/1024:.1f}KB" if file_size < 1024*1024 else f"{file_size/(1024*1024):.1f}MB"
+            console.print(f"\n[green]✓ 已导出 {count} 篇到: {export_path}[/green] [dim]({size_str}, {fmt})[/dim]")
+        except (IOError, OSError) as e:
+            console.print(f"[red]错误：导出失败 ({e})[/red]")
 
 
 @draft.command()

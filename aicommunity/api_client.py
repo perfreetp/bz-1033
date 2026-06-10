@@ -396,6 +396,7 @@ class APIClient:
     """社区API客户端（包含模拟数据和本地持久化）。"""
 
     CACHE_KEY = "aicommunity_state_v2"  # v2: 支持多用户profile隔离
+    LEGACY_CACHE_KEY = "aicommunity_state_v1"
 
     def __init__(self, config: ConfigManager):
         self.config = config
@@ -417,10 +418,73 @@ class APIClient:
             }
         return self._user_profiles[user]
 
+    def _migrate_v1_to_v2(self, v1_state: Dict[str, Any], cache: Dict[str, Any]) -> None:
+        """迁移旧版v1缓存到新版v2结构，迁移前生成备份。"""
+        # 备份
+        backup_key = f"aicommunity_state_v1_backup_{int(time.time())}"
+        cache[backup_key] = json.loads(json.dumps(v1_state))  # 深拷贝备份
+
+        # 全局共享数据直接迁移
+        self._posts = v1_state.get("posts", [p.copy() for p in MOCK_POSTS])
+        self._drafts = v1_state.get("drafts", [d.copy() for d in MOCK_DRAFTS])
+        self._prompts = v1_state.get("prompts", [p.copy() for p in MOCK_PROMPTS])
+        self._notifications = v1_state.get("notifications", [n.copy() for n in MOCK_NOTIFICATIONS])
+        self._comments = v1_state.get("comments", {k: [c.copy() for c in v] for k, v in MOCK_COMMENTS.items()})
+        self._activities = v1_state.get("activities", [a.copy() for a in MOCK_ACTIVITIES])
+
+        # 给每篇草稿补 versions 字段（若没有）
+        for d in self._drafts:
+            if "versions" not in d:
+                d["versions"] = [{
+                    "version": 1,
+                    "title": d.get("title", ""),
+                    "content": d.get("content", ""),
+                    "summary": d.get("summary", ""),
+                    "created_at": d.get("created_at", datetime.now().isoformat()),
+                }]
+
+        # 给每个提示词补 is_public 字段（默认 True）
+        for p in self._prompts:
+            if "is_public" not in p:
+                p["is_public"] = True
+            if "is_favorited" in p:
+                del p["is_favorited"]  # 移除废弃字段，改用user_profiles存储
+
+        # 迁移用户私有状态到 writer（兼容旧版默认在 writer 登录下修改）
+        writer_profile = self._get_user_profile("writer")
+        writer_profile["liked_posts"] = v1_state.get("liked_posts", [p["id"] for p in self._posts if p.get("is_liked")])
+        writer_profile["favorites"] = v1_state.get("favorites", {"posts": [], "prompts": [], "comments": []})
+        writer_profile["following"] = v1_state.get("following", [])
+        writer_profile["read_notifications"] = [n["id"] for n in self._notifications if n.get("read")]
+
+        # 清理 posts 中被用户状态覆盖的废弃字段（is_liked/is_favorited由视图注入）
+        for p in self._posts:
+            p.pop("is_liked", None)
+            p.pop("is_favorited", None)
+
+        # 同步给 admin 和 demo 用户默认空结构，避免切换时报无版本问题
+        self._get_user_profile("admin")
+        self._get_user_profile("demo")
+
+        # 保存备份key提示
+        self.config.set("last_migration_backup", backup_key)
+        console.print(f"[dim]🔄 检测到旧版v1缓存，已自动迁移到v2结构（备份key: {backup_key}）[/dim]")
+
     def _load_state(self) -> None:
-        """从本地cache加载状态，若无则使用默认mock数据。"""
+        """从本地cache加载状态，支持v1→v2自动迁移，若无则使用默认mock数据。"""
         cache = self.config.load_cache()
-        state = cache.get(self.CACHE_KEY, {})
+
+        # 先尝试加载新版 v2
+        state = cache.get(self.CACHE_KEY, None)
+
+        if state is None and self.LEGACY_CACHE_KEY in cache:
+            # === 触发 v1 → v2 迁移 ===
+            v1_state = cache[self.LEGACY_CACHE_KEY]
+            self._user_profiles: Dict[str, Dict[str, Any]] = {}
+            self._migrate_v1_to_v2(v1_state, cache)
+            # 迁移完成后写入新结构
+            self.save()
+            return
 
         if state:
             # 全局共享数据（所有用户可见）
@@ -432,27 +496,43 @@ class APIClient:
             self._activities = state.get("activities", [])
             # 按用户隔离的数据
             self._user_profiles = state.get("user_profiles", {})
-        else:
-            # 全局共享数据
-            self._posts = [p.copy() for p in MOCK_POSTS]
-            self._drafts = [d.copy() for d in MOCK_DRAFTS]
-            self._prompts = [p.copy() for p in MOCK_PROMPTS]
-            self._notifications = [n.copy() for n in MOCK_NOTIFICATIONS]
-            self._comments = {k: [c.copy() for c in v] for k, v in MOCK_COMMENTS.items()}
-            self._activities = [a.copy() for a in MOCK_ACTIVITIES]
-            # 按用户隔离：默认writer用户有一些初始状态（匹配MOCK数据）
-            self._user_profiles: Dict[str, Dict[str, Any]] = {}
-            writer_profile = self._get_user_profile("writer")
-            writer_profile["liked_posts"] = ["post_002", "post_004"]
-            writer_profile["favorites"] = {"posts": ["post_002"], "prompts": ["prompt_001", "prompt_002"], "comments": []}
-            writer_profile["following"] = [f.copy() for f in MOCK_FOLLOWING]
-            writer_profile["read_notifications"] = [n["id"] for n in self._notifications if n.get("read")]
-            admin_profile = self._get_user_profile("admin")
-            admin_profile["favorites"] = {"posts": ["post_005"], "prompts": ["prompt_002"], "comments": []}
-            admin_profile["liked_posts"] = ["post_005"]
-            admin_profile["following"] = []
-            admin_profile["read_notifications"] = []
-            self.save()
+            return
+
+        # 完全没有缓存：初始化为默认mock数据
+        self._posts = [p.copy() for p in MOCK_POSTS]
+        self._drafts = [d.copy() for d in MOCK_DRAFTS]
+        self._prompts = [p.copy() for p in MOCK_PROMPTS]
+        self._notifications = [n.copy() for n in MOCK_NOTIFICATIONS]
+        self._comments = {k: [c.copy() for c in v] for k, v in MOCK_COMMENTS.items()}
+        self._activities = [a.copy() for a in MOCK_ACTIVITIES]
+
+        # 初始化草稿版本号（mock数据可能没有versions）
+        for d in self._drafts:
+            if "versions" not in d:
+                d["versions"] = [{
+                    "version": 1,
+                    "title": d.get("title", ""),
+                    "content": d.get("content", ""),
+                    "summary": d.get("summary", ""),
+                    "created_at": d.get("created_at", datetime.now().isoformat()),
+                }]
+
+        # 按用户隔离：默认writer用户有一些初始状态（匹配MOCK数据）
+        self._user_profiles: Dict[str, Dict[str, Any]] = {}
+        writer_profile = self._get_user_profile("writer")
+        writer_profile["liked_posts"] = ["post_002", "post_004"]
+        writer_profile["favorites"] = {"posts": ["post_002"], "prompts": ["prompt_001", "prompt_002"], "comments": []}
+        writer_profile["following"] = [f.copy() for f in MOCK_FOLLOWING]
+        writer_profile["read_notifications"] = []
+
+        admin_profile = self._get_user_profile("admin")
+        admin_profile["favorites"] = {"posts": ["post_005"], "prompts": ["prompt_002"], "comments": []}
+        admin_profile["liked_posts"] = ["post_005"]
+        admin_profile["following"] = []
+        admin_profile["read_notifications"] = []
+
+        self._get_user_profile("demo")
+        self.save()
 
     def save(self) -> None:
         """将当前状态保存到本地cache。"""
@@ -565,13 +645,52 @@ class APIClient:
     # ==================== 草稿相关 ====================
 
     def list_drafts(self, status: Optional[str] = None, author: Optional[str] = None,
-                    sort_by: str = "updated_at") -> List[Dict[str, Any]]:
-        """列出草稿，支持状态、作者筛选和排序。"""
+                    sort_by: str = "updated_at",
+                    days: Optional[int] = None,
+                    from_date: Optional[str] = None,
+                    to_date: Optional[str] = None,
+                    only_local: bool = False,
+                    mine_only: bool = True) -> List[Dict[str, Any]]:
+        """列出草稿，支持状态、作者、时间、同步状态多维筛选。
+
+        - mine_only=True 默认只看当前用户的草稿（设为False可看所有）
+        - days: 最近N天（按updated_at）
+        - from_date/to_date: YYYY-MM-DD 起止日期（按updated_at）
+        - only_local: 仅本地未同步的（is_synced=False）
+        """
         drafts = list(self._drafts)
+
+        # 作者/我自己筛选
+        if mine_only:
+            username = self._current_user()
+            drafts = [d for d in drafts if d.get("author") == username]
+        elif author:
+            drafts = [d for d in drafts if d.get("author") == author]
+
         if status:
             drafts = [d for d in drafts if d["status"] == status]
-        if author:
-            drafts = [d for d in drafts if d.get("author") == author]
+        if only_local:
+            drafts = [d for d in drafts if not d.get("is_synced", False)]
+
+        # 时间筛选
+        from datetime import datetime as _dt, timedelta as _td
+        now = _dt.now()
+        if days:
+            cutoff = now - _td(days=days)
+            drafts = [d for d in drafts if _dt.fromisoformat(d.get("updated_at", now.isoformat())) >= cutoff]
+        if from_date:
+            try:
+                start = _dt.fromisoformat(f"{from_date}T00:00:00")
+                drafts = [d for d in drafts if _dt.fromisoformat(d.get("updated_at", start.isoformat())) >= start]
+            except (ValueError, TypeError):
+                pass
+        if to_date:
+            try:
+                end = _dt.fromisoformat(f"{to_date}T23:59:59")
+                drafts = [d for d in drafts if _dt.fromisoformat(d.get("updated_at", end.isoformat())) <= end]
+            except (ValueError, TypeError):
+                pass
+
         # 默认按更新时间倒序（新→旧）
         drafts.sort(key=lambda d: d.get(sort_by, ""), reverse=True)
         return drafts
@@ -737,12 +856,24 @@ class APIClient:
     def list_prompts(self, page: int = 1, page_size: int = 20, category: Optional[str] = None,
                      sort_by: str = "rating", mine_only: bool = False,
                      only_favorites: bool = False, only_public: bool = False) -> Tuple[List[Dict[str, Any]], int]:
-        """列出提示词，支持分类、仅看我的、收藏筛选、公开筛选。"""
+        """列出提示词（严格可见性控制）。
+
+        - 公共浏览（非mine）：只能看到 公开(is_public=True) 的所有提示词
+        - 我的(mine_only=True)：可看到自己全部（含私有）
+        - 同时 only_public 会再过滤（只看公开）
+        - 永远不会看到他人的私有提示词
+        """
         username = self._current_user()
         profile = self._get_user_profile()
         prompts = list(self._prompts)
-        if mine_only:
+
+        # === 可见性核心过滤：他人私有一律拦截 ===
+        if not mine_only:
+            prompts = [p for p in prompts if p.get("is_public", True)]
+        else:
+            # 只看我的（含我自己的私有内容）
             prompts = [p for p in prompts if p.get("author") == username]
+
         if category:
             prompts = [p for p in prompts if p.get("category") == category]
         if only_favorites:
@@ -753,21 +884,34 @@ class APIClient:
         prompts.sort(key=lambda p: p.get(sort_by, 0), reverse=True)
         total = len(prompts)
         start = (page - 1) * page_size
-        # 注入当前用户的收藏标记
         result = [self._inject_user_view_flags(p, "prompt") for p in prompts[start:start + page_size]]
         return result, total
 
     def get_prompt(self, prompt_id: str) -> Optional[Dict[str, Any]]:
-        """获取提示词详情（带当前用户视图标记）。"""
+        """获取提示词详情（含权限校验：他人私有提示词返回None）。"""
+        username = self._current_user()
         for prompt in self._prompts:
             if prompt["id"] == prompt_id:
+                # 他人私有 → 拦截（假装不存在）
+                if not prompt.get("is_public", True) and prompt.get("author") != username:
+                    return None
                 return self._inject_user_view_flags(prompt, "prompt")
         return None
 
-    def get_prompt_raw(self, prompt_id: str) -> Optional[Dict[str, Any]]:
-        """获取提示词原始数据（供内部修改）。"""
+    def _get_prompt_raw_unchecked(self, prompt_id: str) -> Optional[Dict[str, Any]]:
+        """内部使用：原始数据获取（不做权限校验，仅用于edit/delete前查找）。"""
         for prompt in self._prompts:
             if prompt["id"] == prompt_id:
+                return prompt
+        return None
+
+    def get_prompt_raw(self, prompt_id: str) -> Optional[Dict[str, Any]]:
+        """获取提示词原始数据（供内部修改，含权限校验）。"""
+        username = self._current_user()
+        for prompt in self._prompts:
+            if prompt["id"] == prompt_id:
+                if not prompt.get("is_public", True) and prompt.get("author") != username:
+                    return None
                 return prompt
         return None
 
@@ -874,9 +1018,10 @@ class APIClient:
     def search(self, query: str, content_type: str = "all",
                min_likes: int = 0, tag: Optional[str] = None,
                page: int = 1, page_size: int = 20) -> Tuple[List[Dict[str, Any]], int]:
-        """搜索内容。"""
+        """搜索内容（提示词严格按可见性过滤，草稿只搜自己的）。"""
         results = []
         query_lower = query.lower()
+        username = self._current_user()
 
         if content_type in ("all", "posts"):
             for post in self._posts:
@@ -886,12 +1031,16 @@ class APIClient:
                 if post.get("likes", 0) < min_likes:
                     match = False
                 if match:
-                    item = post.copy()
+                    item = self._inject_user_view_flags(post, "post")
                     item["_type"] = "post"
                     results.append(item)
 
         if content_type in ("all", "prompts"):
             for prompt in self._prompts:
+                # === 提示词可见性过滤：他人私有一律排除 ===
+                is_private = not prompt.get("is_public", True)
+                if is_private and prompt.get("author") != username:
+                    continue
                 match = (query_lower in prompt["title"].lower() or
                          query_lower in prompt["content"].lower() or
                          any(query_lower in t.lower() for t in prompt.get("tags", [])))
@@ -900,13 +1049,16 @@ class APIClient:
                 if prompt.get("favorites", 0) < min_likes:
                     match = False
                 if match:
-                    item = prompt.copy()
+                    item = self._inject_user_view_flags(prompt, "prompt")
                     item["_type"] = "prompt"
                     item["likes"] = item.get("favorites", 0)
                     results.append(item)
 
         if content_type in ("all", "drafts"):
+            # 草稿只搜索自己的
             for draft in self._drafts:
+                if draft.get("author") != username:
+                    continue
                 match = query_lower in draft["title"].lower() or query_lower in draft["content"].lower()
                 if tag and tag not in draft.get("tags", []):
                     match = False
@@ -1148,20 +1300,45 @@ class APIClient:
     # ==================== 导出相关 ====================
 
     def get_user_stats(self, months: int = 1) -> Dict[str, Any]:
-        """获取用户统计数据（用于月报生成）。"""
-        username = self.config.get("username", "anonymous")
+        """获取用户统计数据（基于当前profile，切换账号各自独立）。"""
+        username = self._current_user()
+        profile = self._get_user_profile()
         user_info = self.config.get("user_info") or {}
 
         start_date = datetime.now() - timedelta(days=30 * months)
         user_posts = [p for p in self._posts if p["author"] == username and datetime.fromisoformat(p["created_at"]) >= start_date]
         user_prompts = [p for p in self._prompts if p["author"] == username and datetime.fromisoformat(p["created_at"]) >= start_date]
         user_drafts = [d for d in self._drafts if d["author"] == username and datetime.fromisoformat(d["updated_at"]) >= start_date]
+        all_user_prompts = [p for p in self._prompts if p["author"] == username]
+        all_user_drafts = [d for d in self._drafts if d["author"] == username]
 
         total_likes = sum(p.get("likes", 0) for p in user_posts)
         total_comments = sum(p.get("comments", 0) for p in user_posts)
         total_views = sum(p.get("views", 0) for p in user_posts)
         total_prompt_usage = sum(p.get("usage_count", 0) for p in user_prompts)
         total_words = sum(d.get("word_count", 0) for d in user_drafts)
+
+        # 草稿版本总数（每个草稿versions数组长度求和）
+        draft_version_count = sum(len(d.get("versions", [])) for d in all_user_drafts)
+
+        # 提示词公私数量
+        public_prompts = sum(1 for p in all_user_prompts if p.get("is_public", True))
+        private_prompts = sum(1 for p in all_user_prompts if not p.get("is_public", True))
+
+        # 点赞数 = profile中liked_posts的长度（当前用户赞了多少帖子）
+        liked_count = len(profile.get("liked_posts", []))
+
+        # 收藏数（我收藏了多少）
+        my_fav_posts = len(profile["favorites"].get("posts", []))
+        my_fav_prompts = len(profile["favorites"].get("prompts", []))
+        my_fav_total = my_fav_posts + my_fav_prompts
+
+        # 我的内容被收藏总数（别人收藏了我多少）
+        post_favorited_by_others = sum(p.get("favorites", 0) for p in user_posts)
+        prompt_favorited_by_others = sum(p.get("favorites", 0) for p in user_prompts)
+
+        # 关注数 = profile中following的长度
+        following_count = len(profile.get("following", []))
 
         return {
             "period": f"{months}个月",
@@ -1170,6 +1347,7 @@ class APIClient:
             "user": {
                 "username": username,
                 "display_name": user_info.get("display_name", username),
+                "avatar": user_info.get("avatar", "👤"),
                 "level": user_info.get("level", 0),
                 "points": user_info.get("points", 0),
             },
@@ -1182,14 +1360,24 @@ class APIClient:
             },
             "prompts": {
                 "count": len(user_prompts),
+                "public": public_prompts,
+                "private": private_prompts,
                 "total_usage": total_prompt_usage,
-                "total_favorites": sum(p.get("favorites", 0) for p in user_prompts),
+                "total_favorites": prompt_favorited_by_others,
             },
             "drafts": {
                 "count": len(user_drafts),
                 "total_words": total_words,
+                "total_versions": draft_version_count,
             },
-            "following": len(self._following),
+            "engagement": {
+                "my_likes": liked_count,                    # 我赞了多少帖子
+                "my_favorites": my_fav_total,               # 我收藏了多少内容
+                "my_favorites_posts": my_fav_posts,         # 我收藏的帖子数
+                "my_favorites_prompts": my_fav_prompts,     # 我收藏的提示词数
+                "my_posts_favorited": post_favorited_by_others,   # 我的帖子被收藏数
+            },
+            "following": following_count,
             "followers": user_info.get("followers", 0),
             "notifications_received": len([n for n in self._notifications if datetime.fromisoformat(n["created_at"]) >= start_date]),
         }
@@ -1295,12 +1483,23 @@ class APIClient:
 
                 f.write("### 提示词\n\n")
                 f.write(f"- **上传数量：** {stats['prompts']['count']} 个\n")
+                f.write(f"- **🌐 公开数量：** {stats['prompts']['public']} 个\n")
+                f.write(f"- **🔒 私有数量：** {stats['prompts']['private']} 个\n")
                 f.write(f"- **总使用次数：** {stats['prompts']['total_usage']:,}\n")
-                f.write(f"- **总收藏数：** {stats['prompts']['total_favorites']:,}\n\n")
+                f.write(f"- **被收藏总数：** {stats['prompts']['total_favorites']:,}\n\n")
 
                 f.write("### 长文草稿\n\n")
                 f.write(f"- **活跃草稿：** {stats['drafts']['count']} 篇\n")
-                f.write(f"- **总字数：** {stats['drafts']['total_words']:,} 字\n\n")
+                f.write(f"- **总字数：** {stats['drafts']['total_words']:,} 字\n")
+                f.write(f"- **📜 编辑版本总数：** {stats['drafts']['total_versions']} 次\n\n")
+
+                eng = stats["engagement"]
+                f.write("## 🤝 社交互动\n\n")
+                f.write(f"- **❤️ 我赞过的帖子：** {eng['my_likes']} 篇\n")
+                f.write(f"- **⭐ 我收藏的帖子：** {eng['my_favorites_posts']} 篇\n")
+                f.write(f"- **⭐ 我收藏的提示词：** {eng['my_favorites_prompts']} 个\n")
+                f.write(f"- **📦 我收藏总数量：** {eng['my_favorites']} 条\n")
+                f.write(f"- **🔥 我的帖子被收藏总数：** {eng['my_posts_favorited']} 次\n\n")
 
                 f.write("## 📬 互动情况\n\n")
                 f.write(f"- **收到通知：** {stats['notifications_received']} 条\n\n")

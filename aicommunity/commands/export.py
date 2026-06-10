@@ -244,8 +244,10 @@ def show_stats(ctx, months):
     console.print("[bold]✨ 提示词数据[/bold]")
     prompt_table = [
         ["上传数量", stats['prompts']['count'], make_bar(stats['prompts']['count'] * 10, max_val)],
+        ["🌐 公开数量", stats['prompts']['public'], make_bar(stats['prompts']['public'] * 10, max_val)],
+        ["🔒 私有数量", stats['prompts']['private'], make_bar(stats['prompts']['private'] * 10, max_val)],
         ["总使用次数", f"{stats['prompts']['total_usage']:,}", make_bar(stats['prompts']['total_usage'], max_val)],
-        ["总收藏数", f"{stats['prompts']['total_favorites']:,}", make_bar(stats['prompts']['total_favorites'], max_val)],
+        ["被收藏数", f"{stats['prompts']['total_favorites']:,}", make_bar(stats['prompts']['total_favorites'], max_val)],
         ["得分贡献", f"{total_prompt_score} 分", make_bar(total_prompt_score, total_score or 1, 20)],
     ]
     console.print(tabulate(prompt_table, headers=["指标", "数值", "分布"], tablefmt="rounded_outline"))
@@ -255,9 +257,28 @@ def show_stats(ctx, months):
     draft_table = [
         ["活跃草稿", stats['drafts']['count'], make_bar(stats['drafts']['count'] * 5, max_val)],
         ["总字数", f"{stats['drafts']['total_words']:,} 字", make_bar(stats['drafts']['total_words'] // 10, max_val)],
+        ["📜 版本总数", stats['drafts']['total_versions'], make_bar(stats['drafts']['total_versions'] * 5, max_val)],
         ["得分贡献", f"{total_draft_score} 分", make_bar(total_draft_score, total_score or 1, 20)],
     ]
     console.print(tabulate(draft_table, headers=["指标", "数值", "分布"], tablefmt="rounded_outline"))
+
+    console.print()
+    console.print("[bold]🤝 社交互动数据[/bold]")
+    eng = stats["engagement"]
+    interact_max = max(
+        eng["my_likes"], eng["my_favorites"],
+        stats["following"], stats["followers"],
+        1,
+    )
+    interact_table = [
+        ["❤️ 我赞过的帖子", eng["my_likes"], make_bar(eng["my_likes"], interact_max, 15)],
+        ["⭐ 我收藏的帖子", eng["my_favorites_posts"], make_bar(eng["my_favorites_posts"], interact_max, 15)],
+        ["⭐ 我收藏的提示词", eng["my_favorites_prompts"], make_bar(eng["my_favorites_prompts"], interact_max, 15)],
+        ["📦 我收藏总数量", eng["my_favorites"], make_bar(eng["my_favorites"], interact_max, 15)],
+        ["👀 我正在关注", stats["following"], make_bar(stats["following"], interact_max, 15)],
+        ["👥 关注我的", f"{stats['followers']}", make_bar(stats['followers'], interact_max, 15)],
+    ]
+    console.print(tabulate(interact_table, headers=["指标", "数值", "分布"], tablefmt="rounded_outline"))
 
     console.print()
     console.print(f"[bold yellow]🏆 综合活跃度总分: {total_score} 分[/bold yellow]")
@@ -316,12 +337,21 @@ def export_activity_csv(ctx, output, months):
             writer.writerow(["帖子", "平均点赞", stats['posts']['avg_likes'], stats['period'], datetime.now().isoformat()])
 
             writer.writerow(["提示词", "上传数量", stats['prompts']['count'], stats['period'], datetime.now().isoformat()])
+            writer.writerow(["提示词", "公开数量", stats['prompts']['public'], stats['period'], datetime.now().isoformat()])
+            writer.writerow(["提示词", "私有数量", stats['prompts']['private'], stats['period'], datetime.now().isoformat()])
             writer.writerow(["提示词", "总使用次数", stats['prompts']['total_usage'], stats['period'], datetime.now().isoformat()])
             writer.writerow(["提示词", "总收藏数", stats['prompts']['total_favorites'], stats['period'], datetime.now().isoformat()])
 
             writer.writerow(["草稿", "活跃草稿数", stats['drafts']['count'], stats['period'], datetime.now().isoformat()])
             writer.writerow(["草稿", "总写作字数", stats['drafts']['total_words'], stats['period'], datetime.now().isoformat()])
+            writer.writerow(["草稿", "编辑版本总数", stats['drafts']['total_versions'], stats['period'], datetime.now().isoformat()])
 
+            eng = stats["engagement"]
+            writer.writerow(["互动", "我赞过的帖子数", eng['my_likes'], stats['period'], datetime.now().isoformat()])
+            writer.writerow(["互动", "我收藏的帖子数", eng['my_favorites_posts'], stats['period'], datetime.now().isoformat()])
+            writer.writerow(["互动", "我收藏的提示词数", eng['my_favorites_prompts'], stats['period'], datetime.now().isoformat()])
+            writer.writerow(["互动", "我收藏总数量", eng['my_favorites'], stats['period'], datetime.now().isoformat()])
+            writer.writerow(["互动", "我的帖子被收藏数", eng['my_posts_favorited'], stats['period'], datetime.now().isoformat()])
             writer.writerow(["互动", "收到通知数", stats['notifications_received'], stats['period'], datetime.now().isoformat()])
 
         file_size = os.path.getsize(output)
